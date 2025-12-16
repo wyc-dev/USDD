@@ -224,7 +224,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             emit ReferrerSet(sender, referrer);
         }
 
-        IERC20(USDC_BASE).safeTransfer(address(this), amount);
         IERC20(USDC_BASE).safeTransfer(vault, amount);
 
         _mint(sender, amount);
