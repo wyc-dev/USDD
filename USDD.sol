@@ -32,6 +32,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     error InvalidAddress();
     error CannotWithdrawUSDD();
     error WithdrawFailed();
+    error BelowMinimumRedemption();
 
     /**
      * @notice VIP status mapping - VIP addresses are exempt from early unstake fees
@@ -302,7 +303,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     /**
      * @notice Deposits USDC to mint USDD 1:1 and optionally sets a referrer
      * @dev Deposits are immediately forwarded to the vault. Large deposits (≥ boundaryAmount) trigger a referral reward to the referrer.
-     *      Gas optimized by direct transfer to the vault without an intermediate step.
+     *      If the deposit includes a referrer and amount ≥ boundaryAmount, the depositor is automatically granted VIP status.
+     *      Gas optimized by direct transfer to vault without intermediate step.
      * @param amount Amount of USDC to deposit (6 decimals)
      * @param referrer Optional referrer address (can only be set once, on first deposit)
      */
@@ -311,7 +313,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         address sender = _msgSender();
 
-        if (referrer != address(0)) {
+        bool hasReferrer = referrer != address(0);
+        if (hasReferrer) {
             if (referrer == sender) revert InvalidReferrer();
             if (referrerAddress[sender] != address(0)) revert AlreadyHasReferrer();
             referrerAddress[sender] = referrer;
@@ -331,6 +334,10 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
                 _mint(referrerAddress[sender], referralReward);
                 emit ReferralRewardMinted(referrerAddress[sender], sender, referralReward, "large_deposit");
             }
+            if (hasReferrer && !isVIP[sender]) {
+                isVIP[sender] = true;
+                emit VIPStatusUpdated(sender, true);
+            }
         }
 
         emit USDCDeposited(sender, amount, referralReward);
@@ -338,7 +345,9 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
     /**
      * @notice Requests redemption by burning USDD and queuing USDC for manual fulfillment
-     * @dev Small amounts (< boundaryAmount) incur a fee paid to the owner. Small redemptions trigger a referral reward.
+     * @dev Non-VIP users must redeem at least boundaryAmount. VIP users have no minimum.
+     *      Small amounts (< boundaryAmount) that pass the minimum check still incur the small-amount fee.
+     *      Small redemptions trigger a referral reward.
      *      Gas optimized with unchecked arithmetic where overflow is impossible.
      * @param amount Amount of USDD to redeem (6 decimals)
      */
@@ -346,6 +355,9 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
 
         address sender = _msgSender();
+
+        // 新功能：非 VIP 用戶必須達到最小贖回額
+        if (!isVIP[sender] && amount < boundaryAmount) revert BelowMinimumRedemption();
 
         IERC20(address(this)).safeTransferFrom(sender, address(this), amount);
 
