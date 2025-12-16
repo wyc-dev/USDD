@@ -356,7 +356,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         address sender = _msgSender();
 
-        // 新功能：非 VIP 用戶必須達到最小贖回額
         if (!isVIP[sender] && amount < boundaryAmount) revert BelowMinimumRedemption();
 
         IERC20(address(this)).safeTransferFrom(sender, address(this), amount);
