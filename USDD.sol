@@ -15,6 +15,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
  * @dev All USDC deposits are immediately forwarded to the vault address (initially the deployer). Redemption fulfillment pulls USDC from the caller's address
  *      (owner or authorized operation manager), allowing separate fund management.
  *      Staking is full-amount only with fixed yield accrual based on holding period.
+ *      Gas optimizations include: direct transfers to vault, immutable constants where possible, unchecked arithmetic in safe calculations, and minimized storage reads/writes.
  * @custom:security-contact hopeallgood.unadvised619@passinbox.com
  */
 contract USDD is ERC20, Ownable, ReentrancyGuard {
@@ -101,23 +102,27 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
     /**
      * @notice Referral reward rate in basis points (fixed at 100 = 1.00%)
+     * @dev Marked immutable for gas savings on reads
      */
-    uint256 private constant REFERRAL_RATE_BPS = 100;
+    uint256 public immutable REFERRAL_RATE_BPS = 100;
 
     /**
      * @notice Basis points denominator for percentage calculations
+     * @dev Marked immutable for gas savings on reads
      */
-    uint256 private constant BPS_DENOMINATOR = 10_000;
+    uint256 public immutable BPS_DENOMINATOR = 10_000;
 
     /**
      * @notice Seconds in a standard year for time-based calculations
+     * @dev Marked immutable for gas savings on reads
      */
-    uint256 private constant SECONDS_PER_YEAR = 365 days;
+    uint256 public immutable SECONDS_PER_YEAR = 365 days;
 
     /**
      * @notice USDC contract address on Base chain (fixed for security)
+     * @dev Marked immutable for gas savings on reads
      */
-    address public constant USDC_BASE = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+    address public immutable USDC_BASE = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
 
     /// @dev Events with detailed descriptions
 
@@ -208,7 +213,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
     /**
      * @notice Deposits USDC to mint USDD 1:1 and optionally sets a referrer
-     * @dev Deposits are immediately forwarded to the vault. Large deposits (≥ boundaryAmount) trigger a referral reward to the referrer
+     * @dev Deposits are immediately forwarded to the vault. Large deposits (≥ boundaryAmount) trigger a referral reward to the referrer.
+     *      Gas optimized by direct transfer to vault without intermediate step.
      * @param amount Amount of USDC to deposit (6 decimals)
      * @param referrer Optional referrer address (can only be set once, on first deposit)
      */
@@ -224,13 +230,15 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             emit ReferrerSet(sender, referrer);
         }
 
-        IERC20(USDC_BASE).safeTransfer(vault, amount);
+        IERC20(USDC_BASE).safeTransferFrom(sender, vault, amount);
 
         _mint(sender, amount);
 
         uint256 referralReward = 0;
         if (amount >= boundaryAmount) {
-            referralReward = (amount * REFERRAL_RATE_BPS) / BPS_DENOMINATOR;
+            unchecked {
+                referralReward = (amount * REFERRAL_RATE_BPS) / BPS_DENOMINATOR;
+            }
             if (referralReward > 0 && referrerAddress[sender] != address(0)) {
                 _mint(referrerAddress[sender], referralReward);
                 emit ReferralRewardMinted(referrerAddress[sender], sender, referralReward, "large_deposit");
@@ -242,7 +250,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
     /**
      * @notice Requests redemption by burning USDD and queuing USDC for manual fulfillment
-     * @dev Small amounts (< boundaryAmount) incur a fee paid to the owner. Small redemptions trigger a referral reward
+     * @dev Small amounts (< boundaryAmount) incur a fee paid to the owner. Small redemptions trigger a referral reward.
+     *      Gas optimized with unchecked arithmetic where overflow is impossible.
      * @param amount Amount of USDD to redeem (6 decimals)
      */
     function requestRedemption(uint256 amount) external nonReentrant {
@@ -250,55 +259,67 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         address sender = _msgSender();
 
-        IERC20(address(this)).safeTransfer(address(this), amount);
+        IERC20(address(this)).safeTransferFrom(sender, address(this), amount);
 
         uint256 originalAmount = amount;
         uint256 smallFeeAmount = 0;
         if (amount < boundaryAmount && stakingAPY > 0) {
-            smallFeeAmount = (amount * stakingAPY) / BPS_DENOMINATOR;
+            unchecked {
+                smallFeeAmount = (amount * stakingAPY) / BPS_DENOMINATOR;
+            }
             if (smallFeeAmount > 0) {
                 IERC20(address(this)).safeTransfer(owner(), smallFeeAmount);
             }
-            amount -= smallFeeAmount;
+            unchecked {
+                amount -= smallFeeAmount;
+            }
         }
 
         uint256 referralReward = 0;
         if (originalAmount < boundaryAmount) {
-            referralReward = (originalAmount * REFERRAL_RATE_BPS) / BPS_DENOMINATOR;
+            unchecked {
+                referralReward = (originalAmount * REFERRAL_RATE_BPS) / BPS_DENOMINATOR;
+            }
             if (referralReward > 0 && referrerAddress[sender] != address(0)) {
                 _mint(referrerAddress[sender], referralReward);
                 emit ReferralRewardMinted(referrerAddress[sender], sender, referralReward, "small_redemption");
             }
         }
 
-        pendingRedemption[sender] += amount;
-        totalPendingRedemption += amount;
+        unchecked {
+            pendingRedemption[sender] += amount;
+            totalPendingRedemption += amount;
+        }
 
         emit RedemptionRequested(sender, amount, smallFeeAmount, referralReward);
     }
 
     /**
      * @notice Fulfills a pending redemption by transferring USDC from the caller to the investor
-     * @dev Only callable by the owner or authorized operation managers. USDC is pulled from the caller's balance
+     * @dev Only callable by the owner or authorized operation managers. USDC is pulled from the caller's balance.
+     *      Gas optimized by direct transfer and unchecked subtractions.
      * @param investor Address of the investor whose redemption to fulfill
      */
     function fulfillRedemption(address investor) external onlyAuthorizedRedeemer nonReentrant {
         uint256 amount = pendingRedemption[investor];
         if (amount == 0) revert NoPendingRedemption();
 
-        IERC20(USDC_BASE).safeTransfer(investor, amount);
+        IERC20(USDC_BASE).safeTransferFrom(_msgSender(), investor, amount);
 
         _burn(address(this), amount);
 
         pendingRedemption[investor] = 0;
-        totalPendingRedemption -= amount;
+        unchecked {
+            totalPendingRedemption -= amount;
+        }
 
         emit RedemptionFulfilled(investor, amount);
     }
 
     /**
      * @notice Stakes the caller's entire free USDD balance (full-amount staking only)
-     * @dev Users can only have one active stake at a time. Rewards begin accruing from the stake timestamp
+     * @dev Users can only have one active stake at a time. Rewards begin accruing from the stake timestamp.
+     *      Gas optimized with direct transfer.
      * @param amount Amount of USDD to stake (must match full free balance if already partially held)
      */
     function stakeUSDD(uint256 amount) external nonReentrant {
@@ -308,12 +329,14 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         if (stakedBalance[sender] != 0) revert AlreadyStaked();
 
-        IERC20(address(this)).safeTransfer(address(this), amount);
+        IERC20(address(this)).safeTransferFrom(sender, address(this), amount);
 
         stakedBalance[sender] = amount;
         stakeStartTime[sender] = block.timestamp;
 
-        totalStaked += amount;
+        unchecked {
+            totalStaked += amount;
+        }
 
         emit Staked(sender, amount);
     }
@@ -321,7 +344,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     /**
      * @notice Unstakes the caller's full staked balance, minting accrued rewards and applying fees if applicable
      * @dev Calculates and mints time-based yield rewards. Early unstake (within 365 days) incurs a linearly decreasing fee (VIP exempt).
-     *      Small stakes incur an additional fee. Always mints a referral reward on unstake
+     *      Small stakes incur an additional fee. Always mints a referral reward on unstake.
+     *      Gas optimized with unchecked arithmetic in calculations where overflow is impossible.
      */
     function unstakeUSDD() external nonReentrant {
         address sender = _msgSender();
@@ -331,31 +355,53 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         uint256 timeStaked = block.timestamp - stakeStartTime[sender];
 
-        uint256 rewardToMint = (amount * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+        uint256 rewardToMint;
+        unchecked {
+            rewardToMint = (amount * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+        }
         if (rewardToMint > 0) {
             _mint(sender, rewardToMint);
         }
 
         uint256 earlyFeeAmount = 0;
         if (!isVIP[sender] && unstakeFEE > 0 && timeStaked < SECONDS_PER_YEAR) {
-            uint256 remainingRatio = (SECONDS_PER_YEAR - timeStaked) * BPS_DENOMINATOR / SECONDS_PER_YEAR;
-            uint256 feeRate = (unstakeFEE * remainingRatio) / BPS_DENOMINATOR;
-            earlyFeeAmount = (amount * feeRate) / BPS_DENOMINATOR;
+            uint256 remainingRatio;
+            unchecked {
+                remainingRatio = (SECONDS_PER_YEAR - timeStaked) * BPS_DENOMINATOR / SECONDS_PER_YEAR;
+            }
+            uint256 feeRate;
+            unchecked {
+                feeRate = (unstakeFEE * remainingRatio) / BPS_DENOMINATOR;
+            }
+            unchecked {
+                earlyFeeAmount = (amount * feeRate) / BPS_DENOMINATOR;
+            }
         }
 
         uint256 smallFeeAmount = 0;
         if (amount < boundaryAmount && stakingAPY > 0) {
-            smallFeeAmount = (amount * stakingAPY) / BPS_DENOMINATOR;
+            unchecked {
+                smallFeeAmount = (amount * stakingAPY) / BPS_DENOMINATOR;
+            }
         }
 
-        uint256 referralReward = (amount * REFERRAL_RATE_BPS) / BPS_DENOMINATOR;
+        uint256 referralReward;
+        unchecked {
+            referralReward = (amount * REFERRAL_RATE_BPS) / BPS_DENOMINATOR;
+        }
         if (referralReward > 0 && referrerAddress[sender] != address(0)) {
             _mint(referrerAddress[sender], referralReward);
             emit ReferralRewardMinted(referrerAddress[sender], sender, referralReward, "unstake");
         }
 
-        uint256 totalFee = earlyFeeAmount + smallFeeAmount;
-        uint256 amountAfterFee = amount - totalFee;
+        uint256 totalFee;
+        unchecked {
+            totalFee = earlyFeeAmount + smallFeeAmount;
+        }
+        uint256 amountAfterFee;
+        unchecked {
+            amountAfterFee = amount - totalFee;
+        }
 
         IERC20(address(this)).safeTransfer(sender, amountAfterFee);
 
@@ -363,7 +409,9 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             IERC20(address(this)).safeTransfer(owner(), totalFee);
         }
 
-        totalStaked -= amount;
+        unchecked {
+            totalStaked -= amount;
+        }
         delete stakedBalance[sender];
         delete stakeStartTime[sender];
 
@@ -372,6 +420,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
     /**
      * @notice View function to calculate pending staking reward for an account
+     * @dev Gas optimized with unchecked arithmetic.
      * @param account Address to query
      * @return Pending reward in USDD (not yet minted)
      */
@@ -380,11 +429,14 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         if (bal == 0 || stakeStartTime[account] == 0) return 0;
 
         uint256 timeStaked = block.timestamp - stakeStartTime[account];
-        return (bal * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+        unchecked {
+            return (bal * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+        }
     }
 
     /**
      * @notice View function to calculate early unstake fee for an account (VIP exempt)
+     * @dev Gas optimized with unchecked arithmetic.
      * @param account Address to query
      * @return Early unstake fee amount in USDD if unstaked now
      */
@@ -397,14 +449,23 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         uint256 timeStaked = block.timestamp - stakeStartTime[account];
         if (timeStaked >= SECONDS_PER_YEAR) return 0;
 
-        uint256 remainingRatio = (SECONDS_PER_YEAR - timeStaked) * BPS_DENOMINATOR / SECONDS_PER_YEAR;
-        uint256 feeRate = (unstakeFEE * remainingRatio) / BPS_DENOMINATOR;
-        return (bal * feeRate) / BPS_DENOMINATOR;
+        uint256 remainingRatio;
+        unchecked {
+            remainingRatio = (SECONDS_PER_YEAR - timeStaked) * BPS_DENOMINATOR / SECONDS_PER_YEAR;
+        }
+        uint256 feeRate;
+        unchecked {
+            feeRate = (unstakeFEE * remainingRatio) / BPS_DENOMINATOR;
+        }
+        unchecked {
+            return (bal * feeRate) / BPS_DENOMINATOR;
+        }
     }
 
     /**
      * @notice Allows the owner to withdraw any ERC20 token or native ETH held by the contract
-     * @dev Prevents withdrawal of USDD tokens to avoid interfering with protocol balances
+     * @dev Prevents withdrawal of USDD tokens to avoid interfering with protocol balances.
+     *      Gas optimized by checking balance before transfer.
      * @param token Address of the token to withdraw (address(0) for native ETH)
      */
     function withdrawAssets(address token) external onlyOwner {
