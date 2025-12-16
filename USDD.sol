@@ -124,21 +124,109 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      */
     address public immutable USDC_BASE = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
 
-    /// @dev Events with detailed descriptions
+    /// @dev Events
 
+    /**
+     * @notice Emitted when the staking APY is updated
+     * @param newAPY The new APY in basis points
+     */
     event StakingAPYUpdated(uint256 indexed newAPY);
+
+    /**
+     * @notice Emitted when the maximum early unstake fee is updated
+     * @param newFEE The new maximum fee in basis points
+     */
     event UnstakeFEEUpdated(uint256 indexed newFEE);
+
+    /**
+     * @notice Emitted when the boundary amount threshold is updated
+     * @param newAmount The new boundary amount
+     */
     event BoundaryAmountUpdated(uint256 indexed newAmount);
+
+    /**
+     * @notice Emitted when the vault address is updated
+     * @param newVault The new vault address
+     */
     event VaultUpdated(address indexed newVault);
+
+    /**
+     * @notice Emitted when a user's VIP status is updated
+     * @param user The user address
+     * @param status The new VIP status
+     */
     event VIPStatusUpdated(address indexed user, bool status);
+
+    /**
+     * @notice Emitted when an operation manager's status is updated
+     * @param manager The manager's address
+     * @param status The new manager status
+     */
     event OperationManagerUpdated(address indexed manager, bool status);
+
+    /**
+     * @notice Emitted when a referrer is set for a user
+     * @param user The user address
+     * @param referrer The referrer address
+     */
     event ReferrerSet(address indexed user, address indexed referrer);
+
+    /**
+     * @notice Emitted when a referral reward is minted
+     * @param referrer The referrer receiving the reward
+     * @param referee The user who triggered the reward
+     * @param amount The reward amount minted
+     * @param reason The context (e.g., "large_deposit", "unstake")
+     */
     event ReferralRewardMinted(address indexed referrer, address indexed referee, uint256 amount, string reason);
+
+    /**
+     * @notice Emitted when USDC is deposited, and USDD is minted
+     * @param user The depositor
+     * @param amount The USDC amount deposited
+     * @param referralReward The referral reward minted (if any)
+     */
     event USDCDeposited(address indexed user, uint256 amount, uint256 referralReward);
+
+    /**
+     * @notice Emitted when a redemption is requested
+     * @param user The user requesting redemption
+     * @param amount The net USDD amount queued after fees
+     * @param smallFeeAmount The small-amount fee deducted (if any)
+     * @param referralReward The referral reward minted (if any)
+     */
     event RedemptionRequested(address indexed user, uint256 amount, uint256 smallFeeAmount, uint256 referralReward);
+
+    /**
+     * @notice Emitted when a pending redemption is fulfilled
+     * @param investor The investor receiving USDC
+     * @param amount The USDC amount transferred
+     */
     event RedemptionFulfilled(address indexed investor, uint256 amount);
+
+    /**
+     * @notice Emitted when USDD is staked
+     * @param user The user staking
+     * @param amount The USDD amount staked
+     */
     event Staked(address indexed user, uint256 amount);
+
+    /**
+     * @notice Emitted when USDD is unstaked
+     * @param user The user unstaking
+     * @param amount The original staked amount
+     * @param earlyFeeAmount The early unstake fee
+     * @param smallFeeAmount The small-amount fee
+     * @param rewardMinted The yield reward minted
+     * @param referralReward The referral reward minted
+     */
     event Unstaked(address indexed user, uint256 amount, uint256 earlyFeeAmount, uint256 smallFeeAmount, uint256 rewardMinted, uint256 referralReward);
+
+    /**
+     * @notice Emitted when the owner withdraws assets
+     * @param token The token address (address(0) for native ETH)
+     * @param amount The amount withdrawn
+     */
     event AssetsWithdrawn(address indexed token, uint256 amount);
 
     modifier onlyAuthorizedRedeemer() {
@@ -214,7 +302,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     /**
      * @notice Deposits USDC to mint USDD 1:1 and optionally sets a referrer
      * @dev Deposits are immediately forwarded to the vault. Large deposits (≥ boundaryAmount) trigger a referral reward to the referrer.
-     *      Gas optimized by direct transfer to vault without intermediate step.
+     *      Gas optimized by direct transfer to the vault without an intermediate step.
      * @param amount Amount of USDC to deposit (6 decimals)
      * @param referrer Optional referrer address (can only be set once, on first deposit)
      */
