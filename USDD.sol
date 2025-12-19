@@ -78,9 +78,9 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     uint256 public totalStaked;
 
     /**
-     * @notice Current staking APY in basis points (e.g., 500 = 5.00%)
+     * @notice Current staking APY in basis points (e.g., 1200 = 12.00%)
      */
-    uint256 public stakingAPY;
+    uint256 public stakingAPY = 1200;
 
     /**
      * @notice Maximum early unstake fee in basis points (e.g., 1000 = 10.00%)
@@ -93,7 +93,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @dev Below this threshold: small-amount fee applies and referral reward on small redemption
      *      At or above: referral reward on large deposit
      */
-    uint256 public boundaryAmount = 1000 * 10**6;
+    uint256 public boundaryAmount = 1 * 10**6;
 
     /**
      * @notice Vault address that receives all deposited USDC
@@ -242,6 +242,14 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      */
     constructor(address initialOwner) ERC20("USDD", "USDD") Ownable(initialOwner) {
         vault = initialOwner;
+        isOperationManager[initialOwner] = true;
+    }
+
+    /**
+     * @notice Returns the number of decimals used by USDD (6 to match USDC 1:1)
+     */
+    function decimals() public view virtual override returns (uint8) {
+        return 6;
     }
 
     /**
