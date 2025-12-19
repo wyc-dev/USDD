@@ -12,10 +12,15 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
  * @notice USDD is a yield-bearing stablecoin representing tokenized real-world assets (RWA) managed by Pantha Capital.
  *         Users can deposit USDC to mint USDD 1:1, stake for fixed APY rewards, request redemption (with manual fulfillment by owner or operation managers),
  *         and benefit from referral rewards. Early unstake and small-amount operations incur fees.
- * @dev All USDC deposits are immediately forwarded to the vault address (initially the deployer). Redemption fulfillment pulls USDC from the caller's address
- *      (owner or authorized operation manager), allowing separate fund management.
- *      Staking is full-amount only with fixed yield accrual based on holding period.
- *      Gas optimizations include: direct transfers to vault, immutable constants where possible, unchecked arithmetic in safe calculations, and minimized storage reads/writes.
+ * @dev    All USDC deposits are immediately forwarded to the vault address (initially the deployer). Redemption fulfillment pulls USDC from the caller's address
+ *         (owner or authorized operation manager), allowing separate fund management.
+ *         The yield backing the protocol is generated off-chain by Pantha Capital deploying the vault-held USDC into low-risk DeFi strategies,
+ *         primarily stablecoin liquidity provision on Uniswap V3 and select other venues (e.g., concentrated liquidity pools in USDC/USDT or USDC/DAI pairs).
+ *         These positions are carefully managed to prioritize capital preservation and consistent yield generation while minimizing impermanent loss exposure.
+ *         The resulting real-world yield funds the fixed APY rewards (distributed via on-chain minting) and ensures sufficient liquidity for manual redemptions,
+ *         effectively bridging traditional fixed-income-like returns with on-chain accessibility.
+ *         Staking is full-amount only with fixed yield accrual based on holding period.
+ *         Gas optimizations include: direct transfers to vault, immutable constants where possible, unchecked arithmetic in safe calculations, and minimized storage reads/writes.
  * @custom:security-contact hopeallgood.unadvised619@passinbox.com
  */
 contract USDD is ERC20, Ownable, ReentrancyGuard {
