@@ -343,6 +343,12 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
                 emit ReferralRewardMinted(referrerAddress[sender], sender, referralReward, "large_deposit");
             }
             if (hasReferrer && !isVIP[sender]) {
+
+                // Automatically grant VIP status only when a referrer is provided on a large deposit.
+                // Intent: Strongly incentivize users to actively seek and use referrer addresses,
+                // driving organic ecosystem growth through referral networks. Deposits without a referrer
+                // (even large ones) do not receive this benefit, encouraging community expansion.
+
                 isVIP[sender] = true;
                 emit VIPStatusUpdated(sender, true);
             }
@@ -371,6 +377,12 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         uint256 originalAmount = amount;
         uint256 smallFeeAmount = 0;
         if (amount < boundaryAmount && stakingAPY > 0) {
+
+            // Deliberately high penalty for small-amount redemptions: fee = current staking APY rate.
+            // Intent: Make it unprofitable for small holders to earn meaningful yield or exit early,
+            // effectively forcing them to deposit larger amounts (≥ boundaryAmount) to access full benefits
+            // and avoid this punitive fee. This encourages capital consolidation and ecosystem growth.
+
             unchecked {
                 smallFeeAmount = (amount * stakingAPY) / BPS_DENOMINATOR;
             }
@@ -424,11 +436,14 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Stakes the caller's entire free USDD balance (full-amount staking only)
-     * @dev Users can only have one active stake at a time. Rewards begin accruing from the stake timestamp.
-     *      Gas optimized with direct transfer.
-     * @param amount Amount of USDD to stake (must match full free balance if already partially held)
-     */
+    * @notice Stakes the caller's entire free USDD balance (full-amount staking only)
+    * @dev Users can only have one active stake at a time to ensure APY accrual is calculated
+    *      fairly and simply based on a single deposit amount and continuous holding period.
+    *      This prevents complex partial staking scenarios that could lead to unfair yield distribution
+    *      or gaming of the time-based rewards. Users must unstake fully before staking again.
+    *      Gas optimized with direct transfer.
+    * @param amount Amount of USDD to stake (must match full intended stake if already partially held)
+    */
     function stakeUSDD(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
 
@@ -449,11 +464,15 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Unstakes the caller's full staked balance, minting accrued rewards and applying fees if applicable
-     * @dev Calculates and mints time-based yield rewards. Early unstake (within 365 days) incurs a linearly decreasing fee (VIP exempt).
-     *      Small stakes incur an additional fee. Always mints a referral reward on unstake.
-     *      Gas optimized with unchecked arithmetic in calculations where overflow is impossible.
-     */
+    * @notice Unstakes the caller's full staked balance, minting accrued rewards and applying fees if applicable
+    * @dev Calculates and mints time-based yield rewards. Early unstake (within 365 days) incurs a linearly decreasing fee (VIP exempt).
+    *      Small stakes incur an additional high punitive fee to discourage small positions.
+    *      Referral reward (1%) is minted on every unstake if a referrer exists.
+    *      To prevent referral farming abuse (repeated stake/unstake cycles), the user's referrer is cleared to address(0) after unstake.
+    *      This forces potential abusers to make a new deposit with a new referrer and hold for at least 1 year
+    *      (to avoid early unstake penalties) before they can trigger another unstake referral reward.
+    *      Gas optimized with unchecked arithmetic in calculations where overflow is impossible.
+    */
     function unstakeUSDD() external nonReentrant {
         address sender = _msgSender();
 
@@ -487,6 +506,12 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         uint256 smallFeeAmount = 0;
         if (amount < boundaryAmount && stakingAPY > 0) {
+
+            // Deliberately high penalty for small stakes: fee = current staking APY rate.
+            // Intent: Prevent small holders from profiting from yield, forcing them to consolidate
+            // into larger positions (≥ boundaryAmount) to access fair APY without punitive deductions.
+            // This design incentivizes larger, longer-term commitments to the protocol.
+
             unchecked {
                 smallFeeAmount = (amount * stakingAPY) / BPS_DENOMINATOR;
             }
@@ -499,6 +524,13 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         if (referralReward > 0 && referrerAddress[sender] != address(0)) {
             _mint(referrerAddress[sender], referralReward);
             emit ReferralRewardMinted(referrerAddress[sender], sender, referralReward, "unstake");
+        }
+
+        // Clear referrer after reward is issued to prevent referral farming loops
+        // Users must make a fresh deposit with a new referrer to qualify for future unstake referrals
+
+        if (referrerAddress[sender] != address(0)) {
+            referrerAddress[sender] = address(0);
         }
 
         uint256 totalFee;
