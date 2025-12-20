@@ -88,7 +88,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     uint256 public stakingAPY = 1200;
 
     /**
-     * @notice Maximum early unstake fee in basis points (e.g., 1000 = 10.00%)
+     * @notice Maximum early unstake fee in basis points (e.g., 600 = 6.00%)
      * @dev Fee decreases linearly to 0 after 365 days; VIP addresses are exempt
      */
     uint256 public unstakeFEE = 600;
@@ -476,6 +476,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     *      To prevent referral farming abuse (repeated stake/unstake cycles), the user's referrer is cleared to address(0) after unstake.
     *      This forces potential abusers to make a new deposit with a new referrer and hold for at least 1 year
     *      (to avoid early unstake penalties) before they can trigger another unstake referral reward.
+    *      To encourage long-term commitment and prevent short-term cycling for rewards, VIP status is automatically revoked
+    *      upon unstake. Users must qualify again (via large referred deposit) to regain VIP privileges on future stakes.
     *      Gas optimized with unchecked arithmetic in calculations where overflow is impossible.
     */
     function unstakeUSDD() external nonReentrant {
@@ -536,6 +538,14 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         if (referrerAddress[sender] != address(0)) {
             referrerAddress[sender] = address(0);
+        }
+
+        // Revoke VIP status on unstake to incentivize long-term holding
+        // VIP privileges must be re-qualified through future large referred deposits
+
+        if (isVIP[sender]) {
+            isVIP[sender] = false;
+            emit VIPStatusUpdated(sender, false);
         }
 
         uint256 totalFee;
