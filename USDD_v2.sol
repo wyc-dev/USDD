@@ -11,17 +11,26 @@ import {UD60x18, ud, pow} from "github.com/PaulRBerg/prb-math/src/UD60x18.sol";
 /**
  * @title USDD on Pantha Capital
  * @notice USDD is a yield-bearing stablecoin representing tokenized real-world assets (RWA) managed by Pantha Capital.
- *         Users can deposit USDC to mint USDD 1:1, stake for fixed APY rewards, request redemption (with manual fulfillment by owner or operation managers),
- *         and benefit from referral rewards. Early unstake and small-amount operations incur fees.
- * @dev    All USDC deposits are immediately forwarded to the vault address (initially the deployer). Redemption fulfillment pulls USDC from the caller's address
- *         (owner or authorized operation manager), allowing separate fund management.
- *         The yield backing the protocol is generated off-chain by Pantha Capital deploying the vault-held USDC into low-risk DeFi strategies,
- *         primarily stablecoin liquidity provision on Uniswap V3 and select other venues (e.g., concentrated liquidity pools in USDC/USDT or USDC/DAI pairs).
- *         These positions are carefully managed to prioritize capital preservation and consistent yield generation while minimizing impermanent loss exposure.
- *         The resulting real-world yield funds the fixed APY rewards (distributed via on-chain minting) and ensures sufficient liquidity for manual redemptions,
- *         effectively bridging traditional fixed-income-like returns with on-chain accessibility.
- *         Staking is full-amount only with fixed yield accrual based on holding period.
- *         Gas optimizations include: direct transfers to vault, immutable constants where possible, unchecked arithmetic in safe calculations, and minimized storage reads/writes.
+ * Users can deposit USDC to mint USDD 1:1, stake for APY-based rewards with strong time-based incentives, request redemption (with manual fulfillment by owner or operation managers),
+ * and benefit from referral rewards. Early unstake and small-amount operations incur fees.
+ * @dev All USDC deposits are immediately forwarded to the vault address (initially the deployer). Redemption fulfillment pulls USDC from the caller's address
+ * (owner or authorized operation manager), allowing separate fund management.
+ * The yield backing the protocol is generated off-chain by Pantha Capital, deploying the vault-held USDC into low-risk DeFi strategies,
+ * primarily stablecoin liquidity provision on Uniswap V3 and select other venues (e.g., concentrated liquidity pools in USDC/USDT or USDC/DAI pairs).
+ * These positions are carefully managed to prioritize capital preservation and consistent yield generation while minimizing impermanent loss exposure.
+ * The resulting real-world yield funds the APY rewards (distributed via on-chain minting) and ensures sufficient liquidity for manual redemptions,
+ * effectively bridging traditional fixed-income-like returns with on-chain accessibility.
+ *
+ * Staking mechanics:
+ * - Full-amount staking only (stake/unstake entire position at once).
+ * - Reward accrual is heavily back-loaded in the first year using a cubic power curve ((time_fraction)^2) to penalize early unstaking
+ *   (rewards accrue very slowly at first, with most of the annual APY earned near the end of the year).
+ * - At exactly 1 year and beyond: switches to linear proportional accrual, delivering the full advertised APY at 1 year and continuing linearly thereafter.
+ * - This design creates a powerful incentive to hold for at least one full year while maintaining simple, predictable long-term yields.
+ * - Calculations for the <1-year curve utilize PRBMath UD60x18 fixed-point library for precise exponentiation.
+ *
+ * Gas optimizations include: direct transfers to vault, immutable constants where possible, unchecked arithmetic in safe calculations,
+ * and minimized storage reads/writes.
  * @custom:security-contact hopeallgood.unadvised619@passinbox.com
  */
 contract USDD is ERC20, Ownable, ReentrancyGuard {
@@ -94,7 +103,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      */
     uint256 public unstakeFEE = 0;
 
-/**
+    /**
      * @notice Referral reward rate in basis points (initially set to 100 = 1.00%)
      * @dev Public variable allowing potential future governance updates if needed.
      *      Current value provides 1% referral reward on qualifying events.
@@ -483,21 +492,22 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         uint256 timeStaked = block.timestamp - stakeStartTime[sender];
 
-        // Reward calculation synchronized with accrueRewardView
+        // Reward calculation synchronized with accrueRewardView - using exaggerated cubic curve for <1 year
         uint256 rewardToMint = 0;
+
         if (timeStaked >= SECONDS_PER_YEAR) {
-            // Linear accrual for ≥1 year
+            // Linear accrual for ≥1 year (continues proportionally beyond 1 year)
             unchecked {
                 rewardToMint = (amount * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
             }
         } else if (timeStaked > 0) {
-            // Compound accrual for <1 year using PRBMath
-            UD60x18 rate = ud(stakingAPY).div(ud(BPS_DENOMINATOR));
-            UD60x18 base = ud(1e18).add(rate);
-            UD60x18 exponent = ud(timeStaked).mul(ud(1e18)).div(ud(SECONDS_PER_YEAR));
-            UD60x18 growth = base.pow(exponent);
-            UD60x18 rewardFactor = growth.sub(ud(1e18));
-            rewardToMint = (amount * rewardFactor.unwrap()) / 1e18;
+            // Exaggerated cubic accrual for <1 year (heavy back-loading / early penalty)
+            UD60x18 timeFrac = ud(timeStaked).mul(ud(1e18)).div(ud(SECONDS_PER_YEAR)); // precise time fraction
+            UD60x18 curvePower = ud(2e18);  // 2.0 = quadratic (very back-loaded)
+            UD60x18 poweredFrac = timeFrac.pow(curvePower); // (time_fraction)^power
+            uint256 fullAnnualReward = (amount * stakingAPY) / BPS_DENOMINATOR;
+
+            rewardToMint = (fullAnnualReward * poweredFrac.unwrap()) / 1e18;
         }
 
         if (rewardToMint > 0) {
@@ -565,9 +575,9 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
     /**
     * @notice View function to calculate pending staking reward for an account
-    * @dev For staking duration < 1 year: uses compound interest formula ((1 + rate)^t - 1), resulting in lower rewards for early unstaking (back-loaded accrual).
-    *      For duration >= 1 year: uses original linear formula (proportional to time), ensuring exact full annual APY proportion at exactly 1 year and continued linear accrual thereafter (no continued exponential compounding).
-    *      Utilizes PRBMath UD60x18 for precise fixed-point exponentiation.
+    * @dev For staking duration < 1 year: uses exaggerated quadratic power curve (time_fraction^2), resulting in strong back-loaded accrual (heavy penalty for early unstaking — rewards mostly accrue near the end of the year).
+    *      For duration >= 1 year: uses original linear formula (proportional to time), ensuring exact full annual APY at exactly 1 year and continued linear accrual thereafter.
+    *      This creates a much more exaggerated curve than standard compounding, while utilizing PRBMath UD60x18 .pow() for exponentiation.
     * @param account Address to query
     * @return Pending reward (uint256)
     */
@@ -578,20 +588,19 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         uint256 timeStaked = block.timestamp - stakeStartTime[account];
 
         if (timeStaked >= SECONDS_PER_YEAR) {
-            // Linear accrual (original formula) - gas optimized with unchecked
+            // Linear accrual (original formula) - gas optimized
             unchecked {
                 return (bal * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
             }
         }
 
-        // Compound accrual only for < 1 year
-        UD60x18 rate = ud(stakingAPY).div(ud(BPS_DENOMINATOR)); // rate as decimal (e.g., 0.1e18 for 10%)
-        UD60x18 base = ud(1e18).add(rate); // 1 + rate
-        UD60x18 exponent = ud(timeStaked).mul(ud(1e18)).div(ud(SECONDS_PER_YEAR)); // precise time fraction
-        UD60x18 growth = base.pow(exponent); // (1 + rate)^t
-        UD60x18 rewardFactor = growth.sub(ud(1e18)); // growth - 1
-        // reward = bal * rewardFactor (scaled back)
-        return (bal * rewardFactor.unwrap()) / 1e18;
+        // Exaggerated quadratic accrual only for < 1 year
+        UD60x18 timeFrac = ud(timeStaked).mul(ud(1e18)).div(ud(SECONDS_PER_YEAR)); // Precise fraction
+        UD60x18 curvePower = ud(2e18); // 2.0 = quadratic (very back-loaded)
+        UD60x18 poweredFrac = timeFrac.pow(curvePower); // (time_fraction)^power
+        uint256 fullAnnualReward = (bal * stakingAPY) / BPS_DENOMINATOR;
+
+        return (fullAnnualReward * poweredFrac.unwrap()) / 1e18;
     }
 
     /**
