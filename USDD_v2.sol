@@ -94,6 +94,13 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      */
     uint256 public unstakeFEE = 0;
 
+/**
+     * @notice Referral reward rate in basis points (initially set to 100 = 1.00%)
+     * @dev Public variable allowing potential future governance updates if needed.
+     *      Current value provides 1% referral reward on qualifying events.
+     */
+    uint256 public reReRate = 100;
+
     /**
      * @notice Threshold amount in USDD (including 6 decimals) for small-amount operations and referral eligibility
      * @dev Below this threshold: small-amount fee applies and referral reward on small redemption
@@ -106,12 +113,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @dev Initially set to the contract deployer; can be updated by owner to a separate treasury
      */
     address public vault;
-
-    /**
-     * @notice Referral reward rate in basis points (fixed at 100 = 1.00%)
-     * @dev Marked immutable for gas savings on reads
-     */
-    uint256 public immutable REFERRAL_RATE_BPS = 100;
 
     /**
      * @notice Basis points denominator for percentage calculations
@@ -144,6 +145,12 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @param newFEE The new maximum fee in basis points
      */
     event UnstakeFEEUpdated(uint256 indexed newFEE);
+
+    /**
+     * @notice Emitted when the referral reward rate is updated
+     * @param newReward The new referral reward rate in basis points
+     */
+    event reReRateUpdated(uint256 indexed newReward);
 
     /**
      * @notice Emitted when the boundary amount threshold is updated
@@ -200,9 +207,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @param user The user requesting redemption
      * @param amount The net USDD amount queued after fees
      * @param smallFeeAmount The small-amount fee deducted (if any)
-     * @param referralReward The referral reward minted (if any)
      */
-    event RedemptionRequested(address indexed user, uint256 amount, uint256 smallFeeAmount, uint256 referralReward);
+    event RedemptionRequested(address indexed user, uint256 amount, uint256 smallFeeAmount);
 
     /**
      * @notice Emitted when a pending redemption is fulfilled
@@ -257,16 +263,21 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Updates the staking APY and maximum early unstake fee in a single transaction
-     * @dev Only callable by the contract owner
-     * @param _newAPY New staking APY in basis points (e.g., 500 = 5.00%)
-     * @param _newFEE New maximum early unstake fee in basis points (e.g., 1000 = 10.00%)
+     * @notice Updates the staking APY, maximum early unstake fee, and referral reward rate in a single transaction
+     * @dev Only callable by the contract owner. All values are in basis points.
+     *      Example: 1200 = 12.00% APY, 600 = 6.00% max early fee, 100 = 1.00% referral reward.
+     * @param _newAPY New staking APY in basis points
+     * @param _newFEE New maximum early unstake fee in basis points
+     * @param _newReferralReward New referral reward rate in basis points
      */
-    function setAPYandFEE(uint256 _newAPY, uint256 _newFEE) external onlyOwner {
+    function setAPYandFEE(uint256 _newAPY, uint256 _newFEE, uint256 _newReferralReward) external onlyOwner {
         stakingAPY = _newAPY;
         unstakeFEE = _newFEE;
+        reReRate = _newReferralReward;
+
         emit StakingAPYUpdated(_newAPY);
         emit UnstakeFEEUpdated(_newFEE);
+        emit reReRateUpdated(_newReferralReward);
     }
 
     /**
@@ -340,7 +351,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         uint256 referralReward = 0;
         if (amount >= boundaryAmount) {
             unchecked {
-                referralReward = (amount * REFERRAL_RATE_BPS) / BPS_DENOMINATOR;
+                referralReward = (amount * reReRate) / BPS_DENOMINATOR;
             }
             if (referralReward > 0 && referrerAddress[sender] != address(0)) {
                 _mint(referrerAddress[sender], referralReward);
@@ -365,7 +376,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @notice Requests redemption by burning USDD and queuing USDC for manual fulfillment
      * @dev Non-VIP users must redeem at least boundaryAmount. VIP users have no minimum.
      *      Small amounts (< boundaryAmount) that pass the minimum check still incur the small-amount fee.
-     *      Small redemptions trigger a referral reward.
      *      Gas optimized with unchecked arithmetic where overflow is impossible.
      * @param amount Amount of USDD to redeem (6 decimals)
      */
@@ -378,7 +388,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         IERC20(address(this)).safeTransferFrom(sender, address(this), amount);
 
-        uint256 originalAmount = amount;
         uint256 smallFeeAmount = 0;
         if (amount < boundaryAmount && stakingAPY > 0) {
 
@@ -398,23 +407,12 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             }
         }
 
-        uint256 referralReward = 0;
-        if (originalAmount < boundaryAmount) {
-            unchecked {
-                referralReward = (originalAmount * REFERRAL_RATE_BPS) / BPS_DENOMINATOR;
-            }
-            if (referralReward > 0 && referrerAddress[sender] != address(0)) {
-                _mint(referrerAddress[sender], referralReward);
-                emit ReferralRewardMinted(referrerAddress[sender], sender, referralReward, "small_redemption");
-            }
-        }
-
         unchecked {
             pendingRedemption[sender] += amount;
             totalPendingRedemption += amount;
         }
 
-        emit RedemptionRequested(sender, amount, smallFeeAmount, referralReward);
+        emit RedemptionRequested(sender, amount, smallFeeAmount);
     }
 
     /**
