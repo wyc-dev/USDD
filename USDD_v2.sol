@@ -480,7 +480,9 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      *      linear accrual for duration ≥ 1 year (ensuring exact full annual APY at 1 year mark and continued proportional growth thereafter).
      *      Early unstake (within 365 days) incurs a linearly decreasing fee (VIP exempt).
      *      Small stakes incur an additional high punitive fee to discourage small positions.
-     *      VIP status is automatically revoked upon unstake to incentivize long-term holding.
+     *      To prevent referral farming abuse (repeated stake/unstake cycles), the user's referrer is cleared to address(0) after unstake.
+     *      This forces potential abusers to make a new deposit with a new referrer and hold for at least 1 year.
+     *      VIP status is automatically revoked upon unstaking to incentivize long-term holding.
      *      Users must re-qualify for VIP through future large referred deposits.
      *      Gas optimized with unchecked arithmetic in safe calculations.
      */
@@ -547,6 +549,13 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         if (isVIP[sender]) {
             isVIP[sender] = false;
             emit VIPStatusUpdated(sender, false);
+        }
+
+        // Clear referrer after reward is issued to prevent referral farming loops
+        // Users must make a fresh deposit with a new referrer to qualify for future unstake referrals
+
+        if (referrerAddress[sender] != address(0)) {
+            referrerAddress[sender] = address(0);
         }
 
         uint256 totalFee;
