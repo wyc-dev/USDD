@@ -98,10 +98,10 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     uint256 public stakingAPY = 1200;
 
     /**
-     * @notice Maximum early unstake fee in basis points (e.g., 600 = 6.00%)
+     * @notice Maximum early unstake fee in basis points (e.g., 100 = 1.00%)
      * @dev Fee decreases linearly to 0 after 365 days; VIP addresses are exempt
      */
-    uint256 public unstakeFEE = 0;
+    uint256 public unstakeFEE = 100;
 
     /**
      * @notice Referral reward rate in basis points (initially set to 100 = 1.00%)
@@ -503,10 +503,10 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
                 rewardToMint = (amount * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
             }
         } else if (timeStaked > 0) {
-            // Exaggerated cubic accrual for <1 year (heavy back-loading / early penalty)
+            // Exaggerated quadratic accrual for <1 year (heavy back-loading / early penalty)
             UD60x18 timeFrac = ud(timeStaked).mul(ud(1e18)).div(ud(SECONDS_PER_YEAR)); // precise time fraction
             UD60x18 curvePower = ud(2e18);  // 2.0 = quadratic (very back-loaded)
-            UD60x18 poweredFrac = timeFrac.pow(curvePower); // (time_fraction)^power
+            UD60x18 poweredFrac = pow(timeFrac, curvePower); // (time_fraction)^power
             uint256 fullAnnualReward = (amount * stakingAPY) / BPS_DENOMINATOR;
 
             rewardToMint = (fullAnnualReward * poweredFrac.unwrap()) / 1e18;
@@ -606,7 +606,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         // Exaggerated quadratic accrual only for < 1 year
         UD60x18 timeFrac = ud(timeStaked).mul(ud(1e18)).div(ud(SECONDS_PER_YEAR)); // Precise fraction
         UD60x18 curvePower = ud(2e18); // 2.0 = quadratic (very back-loaded)
-        UD60x18 poweredFrac = timeFrac.pow(curvePower); // (time_fraction)^power
+        UD60x18 poweredFrac = pow(timeFrac, curvePower); // (time_fraction)^power
         uint256 fullAnnualReward = (bal * stakingAPY) / BPS_DENOMINATOR;
 
         return (fullAnnualReward * poweredFrac.unwrap()) / 1e18;
