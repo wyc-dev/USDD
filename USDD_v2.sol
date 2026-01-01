@@ -6,28 +6,25 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import {UD60x18, ud, pow} from "github.com/PaulRBerg/prb-math/src/UD60x18.sol";
 
 /**
  * @title USDD on Pantha Capital
  * @notice USDD is a yield-bearing stablecoin representing tokenized real-world assets (RWA) managed by Pantha Capital.
- * Users can deposit USDC to mint USDD 1:1, stake for APY-based rewards with strong time-based incentives, request redemption (with manual fulfillment by owner or operation managers),
- * and benefit from referral rewards. Early unstake and small-amount operations incur fees.
+ * Users can deposit USDC to mint USDD 1:1, stake for linear APY-based rewards, request redemption (with manual fulfillment by owner or operation managers),
+ * and benefit from referral rewards on large deposits. Early unstake (non-VIP) and small-amount operations incur fees.
  * @dev All USDC deposits are immediately forwarded to the vault address (initially the deployer). Redemption fulfillment pulls USDC from the caller's address
  * (owner or authorized operation manager), allowing separate fund management.
  * The yield backing the protocol is generated off-chain by Pantha Capital, deploying the vault-held USDC into low-risk DeFi strategies,
- * primarily stablecoin liquidity provision on Uniswap V3 and select other venues (e.g., concentrated liquidity pools in USDC/USDT or USDC/DAI pairs).
- * These positions are carefully managed to prioritize capital preservation and consistent yield generation while minimizing impermanent loss exposure.
- * The resulting real-world yield funds the APY rewards (distributed via on-chain minting) and ensures sufficient liquidity for manual redemptions,
- * effectively bridging traditional fixed-income-like returns with on-chain accessibility.
+ * primarily stablecoin liquidity provision on Uniswap V3 and select other venues.
+ * These positions are managed to prioritize capital preservation and consistent yield generation.
+ * The resulting real-world yield funds the APY rewards (distributed via on-chain minting) and ensures liquidity for manual redemptions.
  *
  * Staking mechanics:
- * - Full-amount staking only (stake/unstake entire position at once).
- * - Reward accrual is heavily back-loaded in the first year using a cubic power curve ((time_fraction)^2) to penalize early unstaking
- *   (rewards accrue very slowly at first, with most of the annual APY earned near the end of the year).
- * - At exactly 1 year and beyond: switches to linear proportional accrual, delivering the full advertised APY at 1 year and continuing linearly thereafter.
- * - This design creates a powerful incentive to hold for at least one full year while maintaining simple, predictable long-term yields.
- * - Calculations for the <1-year curve utilize PRBMath UD60x18 fixed-point library for precise exponentiation.
+ * - Full-amount staking only (stake/unstake entire free balance at once).
+ * - Reward accrual is linear and time-proportional, delivering proportional share of the annual APY based on holding duration.
+ * - Early unstake (< 365 days, non-VIP) incurs a linearly decreasing fee on principal (max at unstakeFEE).
+ * - Small stakes/redemptions (< boundaryAmount) incur a punitive fee equal to the current APY rate.
+ * - This design incentivizes long-term holding and larger positions while keeping calculations simple and predictable.
  *
  * Gas optimizations include: direct transfers to vault, immutable constants where possible, unchecked arithmetic in safe calculations,
  * and minimized storage reads/writes.
@@ -475,17 +472,17 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Unstakes the caller's full staked balance, minting accrued rewards and applying fees if applicable
-     * @dev Reward calculation matches accrueRewardView: compound interest for staking duration < 1 year (back-loaded accrual to discourage early exit),
-     *      linear accrual for duration ≥ 1 year (ensuring exact full annual APY at 1 year mark and continued proportional growth thereafter).
-     *      Early unstake (within 365 days) incurs a linearly decreasing fee (VIP exempt).
-     *      Small stakes incur an additional high punitive fee to discourage small positions.
-     *      To prevent referral farming abuse (repeated stake/unstake cycles), the user's referrer is cleared to address(0) after unstake.
-     *      This forces potential abusers to make a new deposit with a new referrer and hold for at least 1 year.
-     *      VIP status is automatically revoked upon unstaking to incentivize long-term holding.
-     *      Users must re-qualify for VIP through future large referred deposits.
-     *      Gas optimized with unchecked arithmetic in safe calculations.
-     */
+    * @notice Unstakes the caller's full staked balance, minting accrued rewards and applying fees if applicable
+    * @dev Calculates and mints time-based yield rewards. Early unstake (within 365 days) incurs a linearly decreasing fee (VIP exempt).
+    *      Small stakes incur an additional high punitive fee to discourage small positions.
+    *      Referral reward (1%) is minted on every unstake if a referrer exists.
+    *      To prevent referral farming abuse (repeated stake/unstake cycles), the user's referrer is cleared to address(0) after unstake.
+    *      This forces potential abusers to make a new deposit with a new referrer and hold for at least 1 year
+    *      (to avoid early unstake penalties) before they can trigger another unstake referral reward.
+    *      To encourage long-term commitment and prevent short-term cycling for rewards, VIP status is automatically revoked
+    *      upon unstake. Users must qualify again (via large referred deposit) to regain VIP privileges on future stakes.
+    *      Gas optimized with unchecked arithmetic in calculations where overflow is impossible.
+    */
     function unstakeUSDD() external nonReentrant {
         address sender = _msgSender();
 
@@ -494,24 +491,10 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         uint256 timeStaked = block.timestamp - stakeStartTime[sender];
 
-        // Reward calculation synchronized with accrueRewardView - using exaggerated cubic curve for <1 year
-        uint256 rewardToMint = 0;
-
-        if (timeStaked >= SECONDS_PER_YEAR) {
-            // Linear accrual for ≥1 year (continues proportionally beyond 1 year)
-            unchecked {
-                rewardToMint = (amount * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
-            }
-        } else if (timeStaked > 0) {
-            // Exaggerated quadratic accrual for <1 year (heavy back-loading / early penalty)
-            UD60x18 timeFrac = ud(timeStaked).mul(ud(1e18)).div(ud(SECONDS_PER_YEAR)); // precise time fraction
-            UD60x18 curvePower = ud(2e18);  // 2.0 = quadratic (very back-loaded)
-            UD60x18 poweredFrac = pow(timeFrac, curvePower); // (time_fraction)^power
-            uint256 fullAnnualReward = (amount * stakingAPY) / BPS_DENOMINATOR;
-
-            rewardToMint = (fullAnnualReward * poweredFrac.unwrap()) / 1e18;
+        uint256 rewardToMint;
+        unchecked {
+            rewardToMint = (amount * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
         }
-
         if (rewardToMint > 0) {
             _mint(sender, rewardToMint);
         }
@@ -533,6 +516,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         uint256 smallFeeAmount = 0;
         if (amount < boundaryAmount && stakingAPY > 0) {
+
             // Deliberately high penalty for small stakes: fee = current staking APY rate.
             // Intent: Prevent small holders from profiting from yield, forcing them to consolidate
             // into larger positions (≥ boundaryAmount) to access fair APY without punitive deductions.
@@ -543,19 +527,19 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             }
         }
 
+        // Clear referrer after reward is issued to prevent referral farming loops
+        // Users must make a fresh deposit with a new referrer to qualify for future unstake referrals
+
+        if (referrerAddress[sender] != address(0)) {
+            referrerAddress[sender] = address(0);
+        }
+
         // Revoke VIP status on unstake to incentivize long-term holding
         // VIP privileges must be re-qualified through future large referred deposits
 
         if (isVIP[sender]) {
             isVIP[sender] = false;
             emit VIPStatusUpdated(sender, false);
-        }
-
-        // Clear referrer after reward is issued to prevent referral farming loops
-        // Users must make a fresh deposit with a new referrer to qualify for future unstake referrals
-
-        if (referrerAddress[sender] != address(0)) {
-            referrerAddress[sender] = address(0);
         }
 
         uint256 totalFee;
@@ -583,33 +567,19 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-    * @notice View function to calculate pending staking reward for an account
-    * @dev For staking duration < 1 year: uses exaggerated quadratic power curve (time_fraction^2), resulting in strong back-loaded accrual (heavy penalty for early unstaking — rewards mostly accrue near the end of the year).
-    *      For duration >= 1 year: uses original linear formula (proportional to time), ensuring exact full annual APY at exactly 1 year and continued linear accrual thereafter.
-    *      This creates a much more exaggerated curve than standard compounding, while utilizing PRBMath UD60x18 .pow() for exponentiation.
-    * @param account Address to query
-    * @return Pending reward (uint256)
-    */
+     * @notice View function to calculate pending staking reward for an account
+     * @dev Gas optimized with unchecked arithmetic.
+     * @param account Address to query
+     * @return Pending reward in USDD (not yet minted)
+     */
     function accrueRewardView(address account) external view returns (uint256) {
         uint256 bal = stakedBalance[account];
         if (bal == 0 || stakeStartTime[account] == 0) return 0;
 
         uint256 timeStaked = block.timestamp - stakeStartTime[account];
-
-        if (timeStaked >= SECONDS_PER_YEAR) {
-            // Linear accrual (original formula) - gas optimized
-            unchecked {
-                return (bal * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
-            }
+        unchecked {
+            return (bal * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
         }
-
-        // Exaggerated quadratic accrual only for < 1 year
-        UD60x18 timeFrac = ud(timeStaked).mul(ud(1e18)).div(ud(SECONDS_PER_YEAR)); // Precise fraction
-        UD60x18 curvePower = ud(2e18); // 2.0 = quadratic (very back-loaded)
-        UD60x18 poweredFrac = pow(timeFrac, curvePower); // (time_fraction)^power
-        uint256 fullAnnualReward = (bal * stakingAPY) / BPS_DENOMINATOR;
-
-        return (fullAnnualReward * poweredFrac.unwrap()) / 1e18;
     }
 
     /**
