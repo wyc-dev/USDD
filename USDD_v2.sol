@@ -687,7 +687,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @notice Allows the owner to directly create a staked position for a investor (external sale/bridging mint-and-stake)
      * @dev Mints the specified USDD amount directly to the contract and immediately stakes it for the investor.
      *      This bypasses normal deposit/flow and inflates supply without corresponding USDC backing — use only
-     *      for fully backed private sales or allocations where USDC is handled off-chain.
+     *      for fully backed private sales, cross-chain staking, or allocations where the fund is handled off-chain.
      *      Requires the investor to have no existing staked balance (full-amount staking rule preserved).
      *      Custom lock period is applied from the current timestamp.
      * @param amount The USDD amount to mint and stake (6 decimals)
