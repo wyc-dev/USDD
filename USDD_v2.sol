@@ -15,7 +15,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
  * @dev All USDC deposits are immediately forwarded to the vault address (initially the deployer). Redemption fulfillment pulls USDC from the caller's address
  * (owner or authorized operation manager), allowing separate fund management.
  * The yield backing the protocol is generated off-chain by Pantha Capital, deploying the vault-held USDC into low-risk DeFi strategies,
- * primarily stablecoin liquidity provision on Uniswap V3 and select other venues.
+ * primarily stablecoin liquidity provision on Uniswap V3 / V4 and select other venues.
  * These positions are managed to prioritize capital preservation and consistent yield generation.
  * The resulting real-world yield funds the APY rewards (distributed via on-chain minting) and ensures liquidity for manual redemptions.
  *
@@ -23,6 +23,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
  * - Full-amount staking only (stake/unstake entire free balance at once).
  * - Reward accrual is linear and time-proportional, delivering proportional share of the annual APY based on holding duration.
  * - Early unstake (< 365 days, non-VIP) incurs a linearly decreasing fee on principal (max at unstakeFEE).
+ * - A configurable minimum lock period enforces a hard lock: unstake is completely blocked until the lock period has elapsed.
  * - Small stakes/redemptions (< boundaryAmount) incur a punitive fee equal to the current APY rate.
  * - This design incentivizes long-term holding and larger positions while keeping calculations simple and predictable.
  *
@@ -45,6 +46,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     error CannotWithdrawUSDD();
     error WithdrawFailed();
     error BelowMinimumRedemption();
+    error LockPeriodNotElapsed();
 
     /**
      * @notice VIP status mapping - VIP addresses are exempt from early unstake fees
@@ -83,6 +85,13 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @dev Used for reward calculation and early unstake fee determination
      */
     mapping(address user => uint256 startTime) public stakeStartTime;
+
+    /**
+     * @notice Timestamp when the user's staked balance becomes unlockable for withdrawal
+     * @dev Calculated as stake timestamp + current minLockPeriod at the time of staking.
+     *      Existing stakes are unaffected by future changes to minLockPeriod.
+     */
+    mapping(address user => uint256 timestamp) public unlockTimestamp;
 
     /**
      * @notice Total USDD currently staked across all users
@@ -131,6 +140,16 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @dev Marked immutable for gas savings on reads
      */
     uint256 public immutable SECONDS_PER_YEAR = 365 days;
+
+    /**
+    * @notice Minimum lock period in seconds that newly staked USDD must remain locked before unstaking is allowed
+    * @dev 
+    *   - Applied only to new stakes at the time of staking (existing stakes remain unaffected).
+    *   - Default is 0 (no hard lock). The owner can update this to enforce a minimum holding period.
+    *   - When a user stakes, their unlockTimestamp is set to stakeStartTime + current minLockPeriod.
+    *   - This provides a hard lock (complete block on unstake) in addition to the soft early unstake fee.
+    */
+    uint256 public minLockPeriod = 0;
 
     /**
      * @notice USDC contract address on Base chain (fixed for security)
@@ -246,6 +265,35 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      */
     event AssetsWithdrawn(address indexed token, uint256 amount);
 
+    /**
+     * @notice Timestamp when the user's staked balance becomes unlockable for withdrawal
+     * @dev Calculated as stake timestamp + current minLockPeriod at the time of staking.
+     *      Existing stakes are unaffected by future changes to minLockPeriod.
+     */
+    event MinLockPeriodUpdated(uint256 indexed newPeriod);
+
+    /**
+     * @notice Emitted when a private sale staking position is directly created by the owner
+     * @param user The user receiving the staked position
+     * @param amount The USDD amount staked
+     * @param lockPeriod The custom lock period applied (in seconds)
+     */
+    event PrivateSaleStaked(address indexed user, uint256 amount, uint256 lockPeriod);
+
+    /**
+     * @notice Emitted when a staker's unlock timestamp is reset by the owner
+     * @param staker The staker address
+     * @param newUnlockTimestamp The new unlock timestamp
+     */
+    event StakingUnlockReset(address indexed staker, uint256 newUnlockTimestamp);
+
+    /**
+     * @notice Emitted when a pending redemption is reverted/cancelled by the owner
+     * @param investor The investor address
+     * @param amount The USDD amount returned to the investor
+     */
+    event RedemptionReverted(address indexed investor, uint256 amount);
+
     modifier onlyAuthorizedRedeemer() {
         if (_msgSender() != owner() && !isOperationManager[_msgSender()]) revert Unauthorized();
         _;
@@ -316,6 +364,16 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     function setVIP(address user, bool status) external onlyOwner {
         isVIP[user] = status;
         emit VIPStatusUpdated(user, status);
+    }
+
+    /**
+    * @notice Updates the minimum lock period applied to new stakes
+    * @dev Only callable by the contract owner. Changes do not retroactively affect existing stakes.
+    * @param newPeriod The new minimum lock period in seconds (set to 0 to disable the hard lock)
+    */
+    function setMinLockPeriod(uint256 newPeriod) external onlyOwner {
+        minLockPeriod = newPeriod;
+        emit MinLockPeriodUpdated(newPeriod);
     }
 
     /**
@@ -463,6 +521,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         stakedBalance[sender] = amount;
         stakeStartTime[sender] = block.timestamp;
+        unlockTimestamp[sender] = block.timestamp + minLockPeriod;
 
         unchecked {
             totalStaked += amount;
@@ -475,7 +534,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     * @notice Unstakes the caller's full staked balance, minting accrued rewards and applying fees if applicable
     * @dev Calculates and mints time-based yield rewards. Early unstake (within 365 days) incurs a linearly decreasing fee (VIP exempt).
     *      Small stakes incur an additional high punitive fee to discourage small positions.
-    *      Referral reward (1%) is minted on every unstake if a referrer exists.
     *      To prevent referral farming abuse (repeated stake/unstake cycles), the user's referrer is cleared to address(0) after unstake.
     *      This forces potential abusers to make a new deposit with a new referrer and hold for at least 1 year
     *      (to avoid early unstake penalties) before they can trigger another unstake referral reward.
@@ -488,6 +546,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
         uint256 amount = stakedBalance[sender];
         if (amount == 0) revert NoStakedBalance();
+        if (block.timestamp < unlockTimestamp[sender]) revert LockPeriodNotElapsed();
 
         uint256 timeStaked = block.timestamp - stakeStartTime[sender];
 
@@ -562,6 +621,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         }
         delete stakedBalance[sender];
         delete stakeStartTime[sender];
+        delete unlockTimestamp[sender];
 
         emit Unstaked(sender, amount, earlyFeeAmount, smallFeeAmount);
     }
@@ -608,6 +668,90 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         unchecked {
             return (bal * feeRate) / BPS_DENOMINATOR;
         }
+    }
+
+    /**
+     * @notice View function to query the remaining hard-lock time for a staked account
+     * @dev Returns 0 if the account has no active stake or if the lock period has already elapsed.
+     * @param account The user address to query
+     * @return remainingSeconds Remaining seconds until the stake becomes unlockable (0 if already unlockable)
+     */
+    function remainingLockTime(address account) external view returns (uint256) {
+        if (stakedBalance[account] == 0 || unlockTimestamp[account] <= block.timestamp) {
+            return 0;
+        }
+        return unlockTimestamp[account] - block.timestamp;
+    }
+
+    /**
+     * @notice Allows the owner to directly create a staked position for a user (private sale/backdoor mint-and-stake)
+     * @dev Mints the specified USDD amount directly to the contract and immediately stakes it for the user.
+     *      This bypasses normal deposit/flow and inflates supply without corresponding USDC backing — use only
+     *      for fully backed private sales or allocations where USDC is handled off-chain.
+     *      Requires the user to have no existing staked balance (full-amount staking rule preserved).
+     *      Custom lock period is applied from the current timestamp.
+     * @param amount The USDD amount to mint and stake (6 decimals)
+     * @param user The user address to stake for
+     * @param timePeriod The custom minimum lock period in seconds (applied from now)
+     */
+    function privateSale(uint256 amount, address user, uint256 timePeriod) external onlyOwner nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        if (user == address(0)) revert InvalidAddress();
+        if (stakedBalance[user] != 0) revert AlreadyStaked();
+
+        // Mint directly to contract (simulates user transfer in normal staking)
+        _mint(address(this), amount);
+
+        stakedBalance[user] = amount;
+        stakeStartTime[user] = block.timestamp;
+        unlockTimestamp[user] = block.timestamp + timePeriod;
+
+        unchecked {
+            totalStaked += amount;
+        }
+
+        emit Staked(user, amount);
+        emit PrivateSaleStaked(user, amount, timePeriod);
+    }
+
+    /**
+     * @notice Allows the owner to reset the unlock timestamp for an existing staked position
+     * @dev Sets a new unlock timestamp based on the current block timestamp + provided timePeriod.
+     *      Can be used to extend or shorten the lock period. Does not affect stakeStartTime or rewards accrual.
+     *      Only affects the hard lock (unstake blockage); early unstake fee (if applicable) is calculated separately.
+     * @param staker The address of the staked user
+     * @param timePeriod The new lock period duration in seconds (added to current timestamp)
+     */
+    function ResetStakerUnlockTime(address staker, uint256 timePeriod) external onlyOwner {
+        if (stakedBalance[staker] == 0) revert NoStakedBalance();
+
+        uint256 newUnlock = block.timestamp + timePeriod;
+        unlockTimestamp[staker] = newUnlock;
+
+        emit StakingUnlockReset(staker, newUnlock);
+    }
+
+    /**
+     * @notice Allows the owner to revert/cancel a user's pending redemption request
+     * @dev Returns the full queued (net) USDD amount from the contract balance to the investor and clears the pending queue.
+     *      Does not refund any small-amount fees already taken (those were transferred to owner).
+     *      Useful for correcting mistaken redemptions or handling special cases.
+     * @param investor The investor address whose redemption to revert
+     */
+    function revertRedemption(address investor) external onlyOwner nonReentrant {
+        uint256 amount = pendingRedemption[investor];
+        if (amount == 0) revert NoPendingRedemption();
+
+        // Return the queued net amount to the investor
+        IERC20(address(this)).safeTransfer(investor, amount);
+
+        pendingRedemption[investor] = 0;
+
+        unchecked {
+            totalPendingRedemption -= amount;
+        }
+
+        emit RedemptionReverted(investor, amount);
     }
 
     /**
