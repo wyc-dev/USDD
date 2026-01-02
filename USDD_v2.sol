@@ -103,10 +103,10 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     uint256 public stakingAPY = 1200;
 
     /**
-     * @notice Maximum early unstake fee in basis points (e.g., 110 = 1.11%)
+     * @notice Maximum early unstake fee in basis points (e.g., 110 = 1.00%)
      * @dev Fee decreases linearly to 0 after 365 days; VIP addresses are exempt
      */
-    uint256 public unstakeFEE = 111;
+    uint256 public unstakeFEE = 100;
 
     /**
      * @notice Referral reward rate in basis points (initially set to 100 = 1.00%)
