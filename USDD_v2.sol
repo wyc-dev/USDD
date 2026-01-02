@@ -223,9 +223,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @notice Emitted when USDC is deposited, and USDD is minted
      * @param user The depositor
      * @param amount The USDC amount deposited
-     * @param referralReward The referral reward minted (if any)
      */
-    event USDCDeposited(address indexed user, uint256 amount, uint256 referralReward);
+    event USDCDeposited(address indexed user, uint256 amount);
 
     /**
      * @notice Emitted when a redemption is requested
@@ -248,6 +247,13 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @param amount The USDD amount staked
      */
     event Staked(address indexed user, uint256 amount);
+
+    /**
+     * @notice Emitted when pending rewards are accrued and compounded into the staked balance during an additional stake
+     * @param user The user whose rewards were compounded
+     * @param amount The reward amount minted and added to staked balance
+     */
+    event RewardsCompounded(address indexed user, uint256 amount);
 
     /**
      * @notice Emitted when USDD is unstaked
@@ -388,52 +394,23 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Deposits USDC to mint USDD 1:1 and optionally sets a referrer
-     * @dev Deposits are immediately forwarded to the vault. Large deposits (≥ boundaryAmount) trigger a referral reward to the referrer.
-     *      If the deposit includes a referrer and amount ≥ boundaryAmount, the depositor is automatically granted VIP status.
-     *      Gas optimized by direct transfer to vault without intermediate step.
+     * @notice Deposits USDC to mint USDD 1:1
+     * @dev USDC is immediately forwarded to the vault address. USDD is minted directly to the depositor.
+     *      This function is a pure deposit mechanism with no referral logic. Referrals and associated rewards
+     *      (including automatic VIP grants) are handled separately during staking for large positions.
+     *      Gas optimized by direct transfer to vault without intermediate steps.
      * @param amount Amount of USDC to deposit (6 decimals)
-     * @param referrer Optional referrer address (can only be set once, on first deposit)
      */
-    function depositUSDC(uint256 amount, address referrer) external nonReentrant {
+    function depositUSDC(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
 
         address investor = _msgSender();
-
-        bool hasReferrer = referrer != address(0);
-        if (hasReferrer) {
-            if (referrer == investor) revert InvalidReferrer();
-            if (referrerAddress[investor] != address(0)) revert AlreadyHasReferrer();
-            referrerAddress[investor] = referrer;
-            emit ReferrerSet(investor, referrer);
-        }
 
         IERC20(USDC_BASE).safeTransferFrom(investor, vault, amount);
 
         _mint(investor, amount);
 
-        uint256 referralReward = 0;
-        if (amount >= boundaryAmount) {
-            unchecked {
-                referralReward = (amount * reReRate) / BPS_DENOMINATOR;
-            }
-            if (referralReward > 0 && referrerAddress[investor] != address(0)) {
-                _mint(referrerAddress[investor], referralReward);
-                emit ReferralRewardMinted(referrerAddress[investor], investor, referralReward, "large_deposit");
-            }
-            if (hasReferrer && !isVIP[investor]) {
-
-                // Automatically grant VIP status only when a referrer is provided on a large deposit.
-                // Intent: Strongly incentivize users to actively seek and use referrer addresses,
-                // driving organic ecosystem growth through referral networks. Deposits without a referrer
-                // (even large ones) do not receive this benefit, encouraging community expansion.
-
-                isVIP[investor] = true;
-                emit VIPStatusUpdated(investor, true);
-            }
-        }
-
-        emit USDCDeposited(investor, amount, referralReward);
+        emit USDCDeposited(investor, amount);
     }
 
     /**
@@ -502,30 +479,129 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-    * @notice Stakes the caller's entire free USDD balance (full-amount staking only)
-    * @dev Users can only have one active stake at a time to ensure APY accrual is calculated
-    *      fairly and simply based on a single deposit amount and continuous holding period.
-    *      This prevents complex partial staking scenarios that could lead to unfair yield distribution
-    *      or gaming of the time-based rewards. Users must unstake fully before staking again.
-    *      Gas optimized with direct transfer.
-    * @param amount Amount of USDD to stake (must match full intended stake if already partially held)
-    */
-    function stakeUSDD(uint256 amount) external nonReentrant {
+     * @notice Allows the owner or authorized operation managers to revert/cancel a investor's pending redemption request
+     * @dev Returns the full queued (net) USDD amount from the contract balance to the investor and clears the pending queue.
+     *      Does not refund any small-amount fees already taken (those were transferred to owner).
+     *      Useful for correcting mistaken redemptions or handling special cases.
+     * @param investor The investor address whose redemption to revert
+     */
+    function revertRedemption(address investor) external onlyAuthorizedRedeemer nonReentrant {
+        uint256 amount = pendingRedemption[investor];
+        if (amount == 0) revert NoPendingRedemption();
+
+        // Return the queued net amount to the investor
+        IERC20(address(this)).safeTransfer(investor, amount);
+
+        pendingRedemption[investor] = 0;
+
+        unchecked {
+            totalPendingRedemption -= amount;
+        }
+
+        emit RedemptionReverted(investor, amount);
+    }
+
+    /**
+     * @notice Stakes a specified amount of the caller's free USDD balance, adding to any existing staked position
+     *         with automatic compounding of pending rewards, and optionally setting a referrer to trigger
+     *         referral rewards and VIP status on large staking actions
+     * @dev Users maintain a single staked position that can be increased over time. When adding to an existing stake:
+     *      - Pending rewards are calculated based on the current staked balance and time elapsed.
+     *      - Rewards are minted directly to the contract and added to the user's staked balance (compounding).
+     *      - The new amount is then added to the compounded staked balance.
+     *      - stakeStartTime is reset to the current timestamp (restarting linear reward accrual on the new total principal).
+     *      - unlockTimestamp is set to the maximum of the existing unlock timestamp and (current timestamp + minLockPeriod),
+     *        ensuring that adding stake cannot shorten an existing lock period and that new additions respect the current minLockPeriod.
+     *      
+     *      Referral mechanics:
+     *      - If a non-zero referrer address is provided and the caller has no existing referrer,
+     *        it is set permanently (until cleared on unstake).
+     *      - If the new staking amount >= boundaryAmount, a referral reward is minted to the referrer
+     *        (current or newly set) at the configured reReRate.
+     *      - Automatic VIP status is granted only if a referrer was explicitly provided in this
+     *        transaction and the new amount is large — incentivizing active use of referral links during
+     *        significant staking actions.
+     *      
+     *      This design maintains simplicity (single position, linear time-based rewards) while enabling
+     *      compounding and additional stakes. Gas optimized with direct transfers, unchecked arithmetic
+     *      where safe, and minimal storage writes.
+     * @param amount Amount of USDD to stake/add (6 decimals; must be > 0 and <= caller's free balance)
+     * @param referrer Optional referrer address (address(0) if none; can only be set once until unstake)
+     */
+    function stakeUSDD(uint256 amount, address referrer) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
 
         address investor = _msgSender();
 
-        if (stakedBalance[investor] != 0) revert AlreadyStaked();
+        // Handle referrer setting (only if provided and not already set)
+        bool hasReferrer = referrer != address(0);
 
+        if (hasReferrer) {
+            if (referrer == investor) revert InvalidReferrer();
+            if (referrerAddress[investor] != address(0)) revert AlreadyHasReferrer();
+
+            referrerAddress[investor] = referrer;
+            emit ReferrerSet(investor, referrer);
+        }
+
+        // Calculate and apply referral reward if new staking amount is large enough
+        uint256 referralReward = 0;
+        if (amount >= boundaryAmount) {
+            unchecked {
+                referralReward = (amount * reReRate) / BPS_DENOMINATOR;
+            }
+            if (referralReward > 0 && referrerAddress[investor] != address(0)) {
+                _mint(referrerAddress[investor], referralReward);
+                emit ReferralRewardMinted(referrerAddress[investor], investor, referralReward, "large_stake");
+            }
+
+            // Auto-grant VIP only when a referrer is explicitly provided in this large staking transaction
+            if (hasReferrer && !isVIP[investor]) {
+                isVIP[investor] = true;
+                emit VIPStatusUpdated(investor, true);
+            }
+        }
+
+        // Transfer the new staking amount to the contract
         IERC20(address(this)).safeTransferFrom(investor, address(this), amount);
 
-        stakedBalance[investor] = amount;
-        stakeStartTime[investor] = block.timestamp;
-        unlockTimestamp[investor] = block.timestamp + minLockPeriod;
+        // Load current staked state
+        uint256 currentStaked = stakedBalance[investor];
 
+        // If there is an existing stake, accrue and compound pending rewards
+        uint256 pendingReward = 0;
+        uint256 newUnlockTimestamp = block.timestamp + minLockPeriod;
+
+        if (currentStaked > 0) {
+            uint256 timeStaked = block.timestamp - stakeStartTime[investor];
+            unchecked {
+                pendingReward = (currentStaked * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+            }
+            if (pendingReward > 0) {
+                _mint(address(this), pendingReward);
+                emit RewardsCompounded(investor, pendingReward); // New event recommended (see below)
+            }
+            unchecked {
+                currentStaked += pendingReward;
+                totalStaked += pendingReward;
+            }
+            
+            // Preserve existing unlock timestamp if it is later (prevents lock shortening)
+            if (unlockTimestamp[investor] > newUnlockTimestamp) {
+                newUnlockTimestamp = unlockTimestamp[investor];
+            }
+        }
+
+        // Add the new staking amount
         unchecked {
+            currentStaked += amount;
             totalStaked += amount;
         }
+
+        // Update storage with new compounded + added balance, reset start time, and updated unlock
+        stakedBalance[investor] = currentStaked;
+        stakeStartTime[investor] = block.timestamp;
+        unlockTimestamp[investor] = newUnlockTimestamp;
 
         emit Staked(investor, amount);
     }
@@ -684,31 +760,71 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Allows the owner to directly create a staked position for a investor (external sale/bridging mint-and-stake)
-     * @dev Mints the specified USDD amount directly to the contract and immediately stakes it for the investor.
-     *      This bypasses normal deposit/flow and inflates supply without corresponding USDC backing — use only
-     *      for fully backed private sales, cross-chain staking, or allocations where the fund is handled off-chain.
-     *      Requires the investor to have no existing staked balance (full-amount staking rule preserved).
-     *      Custom lock period is applied from the current timestamp.
-     * @param amount The USDD amount to mint and stake (6 decimals)
-     * @param investor The investor address to stake for
-     * @param timePeriod The custom minimum lock period in seconds (applied from now)
+     * @notice Allows the owner to directly mint and stake/add USDD for an investor (e.g., private sale, bridging, off-chain allocations)
+     * @dev Mints the specified USDD amount directly to the contract and adds it to the investor's staked position.
+     *      This bypasses normal deposit flow and inflates supply without corresponding on-chain USDC backing —
+     *      use only for fully backed private sales, cross-chain staking, or allocations where funds are handled off-chain.
+     *      
+     *      Supports adding to existing stakes with automatic reward compounding:
+     *      - If the investor has an existing staked position, pending rewards are calculated, minted to the contract,
+     *        and added to the staked balance (compounding).
+     *      - The new minted amount is then added to the (compounded) staked balance.
+     *      - stakeStartTime is reset to the current timestamp (restarting linear reward accrual on the new total principal).
+     *      - unlockTimestamp is set to the maximum of the existing unlock timestamp and (current timestamp + provided timePeriod),
+     *        ensuring that adding cannot shorten an existing lock period and that the new addition respects the custom timePeriod.
+     *      
+     *      Gas optimized with direct minting, unchecked arithmetic where safe, and minimal storage operations.
+     * @param amount The USDD amount to mint and stake/add (6 decimals)
+     * @param investor The investor address to stake/add for
+     * @param timePeriod The custom lock period extension in seconds (applied to the new addition from now)
      */
     function externalSale(uint256 amount, address investor, uint256 timePeriod) external onlyOwner nonReentrant {
         if (amount == 0) revert ZeroAmount();
         if (investor == address(0)) revert InvalidAddress();
-        if (stakedBalance[investor] != 0) revert AlreadyStaked();
 
-        // Mint directly to contract (simulates investor transfer in normal staking)
+        // Mint the new amount directly to the contract
         _mint(address(this), amount);
 
-        stakedBalance[investor] = amount;
-        stakeStartTime[investor] = block.timestamp;
-        unlockTimestamp[investor] = block.timestamp + timePeriod;
+        // Load current staked state
+        uint256 currentStaked = stakedBalance[investor];
 
+        // If there is an existing stake, accrue and compound pending rewards
+        uint256 pendingReward = 0;
+        uint256 newUnlockTimestamp = block.timestamp + timePeriod;
+
+        if (currentStaked > 0) {
+            uint256 timeStaked = block.timestamp - stakeStartTime[investor];
+
+            unchecked {
+                pendingReward = (currentStaked * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+            }
+
+            if (pendingReward > 0) {
+                _mint(address(this), pendingReward);
+                emit RewardsCompounded(investor, pendingReward);
+            }
+
+            unchecked {
+                currentStaked += pendingReward;
+                totalStaked += pendingReward;
+            }
+
+            // Preserve existing unlock timestamp if it is later (prevents lock shortening)
+            if (unlockTimestamp[investor] > newUnlockTimestamp) {
+                newUnlockTimestamp = unlockTimestamp[investor];
+            }
+        }
+
+        // Add the new minted amount
         unchecked {
+            currentStaked += amount;
             totalStaked += amount;
         }
+
+        // Update storage with new compounded + added balance, reset start time, and updated unlock
+        stakedBalance[investor] = currentStaked;
+        stakeStartTime[investor] = block.timestamp;
+        unlockTimestamp[investor] = newUnlockTimestamp;
 
         emit Staked(investor, amount);
         emit externalSaleStaked(investor, amount, timePeriod);
@@ -729,29 +845,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         unlockTimestamp[investor] = newUnlock;
 
         emit StakingUnlockReset(investor, newUnlock);
-    }
-
-    /**
-     * @notice Allows the owner to revert/cancel a investor's pending redemption request
-     * @dev Returns the full queued (net) USDD amount from the contract balance to the investor and clears the pending queue.
-     *      Does not refund any small-amount fees already taken (those were transferred to owner).
-     *      Useful for correcting mistaken redemptions or handling special cases.
-     * @param investor The investor address whose redemption to revert
-     */
-    function revertRedemption(address investor) external onlyOwner nonReentrant {
-        uint256 amount = pendingRedemption[investor];
-        if (amount == 0) revert NoPendingRedemption();
-
-        // Return the queued net amount to the investor
-        IERC20(address(this)).safeTransfer(investor, amount);
-
-        pendingRedemption[investor] = 0;
-
-        unchecked {
-            totalPendingRedemption -= amount;
-        }
-
-        emit RedemptionReverted(investor, amount);
     }
 
     /**
