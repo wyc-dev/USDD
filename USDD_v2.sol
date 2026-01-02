@@ -515,11 +515,11 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      *      Referral mechanics:
      *      - If a non-zero referrer address is provided and the caller has no existing referrer,
      *        it is set permanently (until cleared on unstake).
-     *      - If the new staking amount >= boundaryAmount, a referral reward is minted to the referrer
-     *        (current or newly set) at the configured reReRate.
-     *      - Automatic VIP status is granted only if a referrer was explicitly provided in this
-     *        transaction and the new amount is large — incentivizing active use of referral links during
-     *        significant staking actions.
+     *      - If the new staking amount >= boundaryAmount and the user has a referrer set, a referral reward is minted to the referrer
+     *        at the configured reReRate.
+     *      - Separately, if a referrer is explicitly provided in this transaction and the new staking amount >= 1000 * boundaryAmount,
+     *        automatic VIP status is granted to the staker (if not already VIP) — incentivizing active use of referral links during
+     *        very large staking actions.
      *      
      *      This design maintains simplicity (single position, linear time-based rewards) while enabling
      *      compounding and additional stakes. Gas optimized with direct transfers, unchecked arithmetic
@@ -543,7 +543,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             emit ReferrerSet(investor, referrer);
         }
 
-        // Calculate and apply referral reward if new staking amount is large enough
+        // Calculate and apply referral reward if new staking amount >= boundaryAmount
         uint256 referralReward = 0;
         if (amount >= boundaryAmount) {
             unchecked {
@@ -551,13 +551,17 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             }
             if (referralReward > 0 && referrerAddress[investor] != address(0)) {
                 _mint(referrerAddress[investor], referralReward);
-                emit ReferralRewardMinted(referrerAddress[investor], investor, referralReward, "large_stake");
+                emit ReferralRewardMinted(referrerAddress[investor], investor, referralReward, "referred_stake");
             }
+        }
 
-            // Auto-grant VIP only when a referrer is explicitly provided in this large staking transaction
-            if (hasReferrer && !isVIP[investor]) {
-                isVIP[investor] = true;
-                emit VIPStatusUpdated(investor, true);
+        // Auto-grant VIP status if a referrer was explicitly provided in this transaction and amount >= 10 * boundaryAmount
+        if (hasReferrer && !isVIP[investor]) {
+            unchecked {
+                if (amount >= boundaryAmount * 1000) {
+                    isVIP[investor] = true;
+                    emit VIPStatusUpdated(investor, true);
+                }
             }
         }
 
