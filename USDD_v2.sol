@@ -36,7 +36,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
     /// @dev Custom errors for gas-efficient reverts
     error ZeroAmount();
-    error AlreadyStaked();
     error NoStakedBalance();
     error NoPendingRedemption();
     error InvalidReferrer();
