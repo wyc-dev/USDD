@@ -144,11 +144,11 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     * @notice Minimum lock period in seconds that newly staked USDD must remain locked before unstaking is allowed
     * @dev 
     *   - Applied only to new stakes at the time of staking (existing stakes remain unaffected).
-    *   - Default is 0 (no hard lock). The owner can update this to enforce a minimum holding period.
+    *   - Default is now 1 day (86400 seconds). The owner can update this to enforce a minimum holding period.
     *   - When a user stakes, their unlockTimestamp is set to stakeStartTime + current minLockPeriod.
     *   - This provides a hard lock (complete block on unstake) in addition to the soft early unstake fee.
     */
-    uint256 public minLockPeriod = 0;
+    uint256 public minLockPeriod = 86400; // 1 day
 
     /**
      * @notice USDC contract address on Base chain (fixed for security)
