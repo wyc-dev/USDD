@@ -90,8 +90,8 @@ flowchart TD
 - **Recommendation** — Invest only what you can afford to risk; monitor protocol updates and vault reports
 
 ## 🔵 Contract Addresses (Base Chain)
-- **USDD Token** — `[Post-deployment]`
-- **USDC** — `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`
+- **USDD Token** — [`0x5b95BaD2844CA1EA17867f8188003e3894C296AE`](https://base.blockscout.com/address/0x5b95BaD2844CA1EA17867f8188003e3894C296AE?tab=index)
+- **USDC** — [`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`](https://base.blockscout.com/token/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)
 
 ## 🔵 Security & Audits
 - Built on latest OpenZeppelin libraries (ERC20, Ownable, ReentrancyGuard, SafeERC20)
@@ -100,4 +100,4 @@ flowchart TD
 - Ongoing static analysis; professional audit recommended for production
 
 ## 🔵 Contact
-Security & Business Inquiries: hopeallgood.unadvised619@passinbox.com
+Security & Business Inquiries: info@pantha.capital
