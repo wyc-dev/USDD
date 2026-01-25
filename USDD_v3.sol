@@ -11,7 +11,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
  * @title USDD on Pantha Capital
  * @notice USDD is a yield-bearing stablecoin representing tokenized real-world assets (RWA) managed by Pantha Capital.
  * Users can deposit USDC to mint USDD 1:1, stake for linear APY-based rewards, request redemption (with manual fulfillment by owner or operation managers),
- * and benefit from referral rewards on large deposits. Early unstake (non-VIP) and small-amount operations incur fees.
+ * and benefit from a two-layer time-based referral system on qualifying staking actions. Early unstake and small-amount operations incur fees.
  * @dev All USDC deposits are immediately forwarded to the vault address (initially the deployer). Redemption fulfillment pulls USDC from the caller's address
  * (owner or authorized operation manager), allowing separate fund management.
  * The yield backing the protocol is generated off-chain by Pantha Capital, deploying the vault-held USDC into low-risk DeFi strategies,
@@ -20,12 +20,19 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
  * The resulting real-world yield funds the APY rewards (distributed via on-chain minting) and ensures liquidity for manual redemptions.
  *
  * Staking mechanics:
- * - Full-amount staking only (stake/unstake entire free balance at once).
+ * - Supports additive staking (partial additions to a single staked position) with full unstake only (unstake entire staked balance at once).
  * - Reward accrual is linear and time-proportional, delivering proportional share of the annual APY based on holding duration.
- * - Early unstake (< 365 days, non-VIP) incurs a linearly decreasing fee on principal (max at unstakeFEE).
+ * - Early unstake (< penaltyPeriod) incurs a linearly decreasing fee on principal (max at unstakeFEE).
  * - A configurable minimum lock period enforces a hard lock: unstake is completely blocked until the lock period has elapsed.
  * - Small stakes/redemptions (< boundaryAmount) incur a punitive fee equal to the current APY rate.
  * - This design incentivizes long-term holding and larger positions while keeping calculations simple and predictable.
+ *
+ * Referral system (two-layer, time-milestone based):
+ * - Layer 1 (direct referrer): Rewards released at milestones (instant: 0.5%, 30 days: 0.5%, 90 days: 1%, 180 days: 1%; total up to 3% of qualifying staked amount).
+ * - Layer 2 (referrer's referrer): Rewards released at milestones (instant: 0.1%, 30 days: 0.1%, 90 days: 0.1%, 180 days: 0.1%; total up to 0.4% of qualifying staked amount).
+ * - Qualifying stakes (≥ boundaryAmount with referrer set) record contributions for independent milestone tracking.
+ * - Rewards can be claimed manually by referrers per referee, or automatically settled on stake additions/unstakes to ensure alignment and prevent loss.
+ * - Referrer is set once on first qualifying stake and cleared on unstake to prevent referral farming abuse.
  *
  * Gas optimizations include: direct transfers to vault, immutable constants where possible, unchecked arithmetic in safe calculations,
  * and minimized storage reads/writes.
@@ -46,11 +53,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     error WithdrawFailed();
     error BelowMinimumRedemption();
     error LockPeriodNotElapsed();
-
-    /**
-     * @notice VIP status mapping - VIP addresses are exempt from early unstake fees
-     */
-    mapping(address user => bool isVip) public isVIP;
+    error InvalidInput();
+    error TooManyContributions();
 
     /**
      * @notice Operation manager status mapping - authorized addresses can fulfill redemptions
@@ -104,12 +108,12 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
     /**
      * @notice Maximum early unstake fee in basis points (e.g., 110 = 1.00%)
-     * @dev Fee decreases linearly to 0 after 365 days; VIP addresses are exempt
+     * @dev Fee decreases linearly to 0 after penaltyPeriod;
      */
     uint256 public unstakeFEE = 100;
 
     /**
-     * @notice Referral reward rate in basis points (initially set to 100 = 1.00%)
+     * @notice Layer1 Referral reward rate in basis points (initially set to 100 = 1.00%)
      * @dev Public variable allowing potential future governance updates if needed.
      *      Current value provides 1% referral reward on qualifying events.
      */
@@ -120,7 +124,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @dev Below this threshold: small-amount fee applies and referral reward on small redemption
      *      At or above: referral reward on large deposit
      */
-    uint256 public boundaryAmount = 1000 * 10**6;
+    uint256 public boundaryAmount = 100 * 10**6;
 
     /**
      * @notice Vault address that receives all deposited USDC
@@ -141,6 +145,11 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     uint256 public immutable SECONDS_PER_YEAR = 365 days;
 
     /**
+     * @notice Seconds in a penalty period for time-based calculations
+     */
+    uint256 public penaltyPeriod = 180 days;
+
+    /**
     * @notice Minimum lock period in seconds that newly staked USDD must remain locked before unstaking is allowed
     * @dev 
     *   - Applied only to new stakes at the time of staking (existing stakes remain unaffected).
@@ -155,6 +164,79 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @dev Marked immutable for gas savings on reads
      */
     address public immutable USDC_BASE = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+
+    // New additions for 2-layer referral system
+
+    /**
+     * @notice Structure to track individual referral contributions for time-based reward milestones.
+     * @dev Each qualifying stake addition records a separate contribution to allow independent milestone progression,
+     *      preventing time resets from affecting prior amounts. This supports additive staking while maintaining
+     *      proportional rewards. layer1ClaimedMilestones and layer2ClaimedMilestones track claimed indices (0-4)
+     *      to prevent duplicate claims. Gas-optimized with uint8 for milestones (max 4).
+     */
+    struct ReferralContribution {
+        uint256 amount; // The staked amount for this contribution (in USDD, 6 decimals)
+        uint256 startTime; // Timestamp when this contribution was recorded
+        uint8 layer1ClaimedMilestones; // Number of milestones claimed for Layer 1 (0-4)
+        uint8 layer2ClaimedMilestones; // Number of milestones claimed for Layer 2 (0-4)
+    }
+
+    /**
+     * @notice Mapping of user addresses to their array of referral contributions.
+     * @dev Allows multiple contributions per user (from additive stakes), enabling independent milestone tracking.
+     *      Array design supports dynamic additions but keeps gas low (realistic contributions <10 per user).
+     *      Cleared on unstake to prevent abuse and reclaim storage.
+     */
+    mapping(address => ReferralContribution[]) public referralContributions;
+
+    /**
+     * @notice Array of milestone periods in seconds for referral reward releases.
+     * @dev Fixed at [0 (instant), 30 days, 90 days, 180 days] for progressive unlocking.
+     *      Not updatable to maintain predictability; changes would require governance upgrades.
+     */
+    uint256[] public milestonePeriods = [0, 30 days, 90 days, 180 days];
+
+    /**
+     * @notice Array of Layer 1 reward rates in basis points (bps) for each milestone.
+     * @dev Initial: [50, 50, 100, 100] bps (0.5%, 0.5%, 1%, 1%; total 3%).
+     *      Updatable by owner (future DAO) to adjust incentives without retroactive effects.
+     */
+    uint256[] public layer1Rates = [50, 50, 100, 100]; // bps: 0.5%, 0.5%, 1%, 1%
+
+    /**
+     * @notice Array of Layer 2 reward rates in basis points (bps) for each milestone.
+     * @dev Initial: [10, 10, 10, 10] bps (0.1% x4; total 0.4%).
+     *      Updatable by owner (future DAO) to fine-tune multi-level incentives.
+     */
+    uint256[] public layer2Rates = [10, 10, 10, 10]; // bps: 0.1%, 0.1%, 0.1%, 0.1%
+
+    /**
+     * @notice Emitted when referral reward rates are updated.
+     * @param layer The layer updated (1 or 2)
+     * @param newRates The new array of rates in bps
+     */
+    event ReferralRatesUpdated(uint8 indexed layer, uint256[] newRates);
+
+    /**
+     * @notice Updates the referral reward rates for Layer 1 and/or Layer 2.
+     * @dev Only callable by the owner (future DAO). Requires exactly 4 rates per array to match milestones.
+     *      Does not affect existing contributions (rates applied at claim time based on current values,
+     *      but to maintain fairness, updates should be prospective). Emits events for transparency.
+     * @param _newLayer1Rates New rates for Layer 1 (empty array skips update)
+     * @param _newLayer2Rates New rates for Layer 2 (empty array skips update)
+     */
+    function setReferralRates(uint256[] calldata _newLayer1Rates, uint256[] calldata _newLayer2Rates) external onlyOwner {
+        if (_newLayer1Rates.length > 0) {
+            if (_newLayer1Rates.length != 4) revert InvalidInput(); // Custom error for array length mismatch
+            layer1Rates = _newLayer1Rates;
+            emit ReferralRatesUpdated(1, _newLayer1Rates);
+        }
+        if (_newLayer2Rates.length > 0) {
+            if (_newLayer2Rates.length != 4) revert InvalidInput();
+            layer2Rates = _newLayer2Rates;
+            emit ReferralRatesUpdated(2, _newLayer2Rates);
+        }
+    }
 
     /// @dev Events
 
@@ -187,13 +269,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @param newVault The new vault address
      */
     event VaultUpdated(address indexed newVault);
-
-    /**
-     * @notice Emitted when a user's VIP status is updated
-     * @param user The user address
-     * @param status The new VIP status
-     */
-    event VIPStatusUpdated(address indexed user, bool status);
 
     /**
      * @notice Emitted when an operation manager's status is updated
@@ -299,6 +374,15 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      */
     event RedemptionReverted(address indexed investor, uint256 amount);
 
+    /**
+     * @notice Emitted when the penalty period for early unstake fees is updated
+     * @param newPeriod The new penalty period in seconds
+     */
+    event PenaltyPeriodUpdated(uint256 indexed newPeriod);
+
+    // New event for referral claims
+    event ReferralRewardClaimed(address indexed referrer, address indexed referee, uint256 amount, uint8 layer);
+
     modifier onlyAuthorizedRedeemer() {
         if (_msgSender() != owner() && !isOperationManager[_msgSender()]) revert Unauthorized();
         _;
@@ -361,17 +445,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Sets or removes VIP status for a user
-     * @dev VIP users are exempt from early unstake fees. Only callable by the contract owner
-     * @param user Address of the user
-     * @param status True to grant VIP status, false to revoke
-     */
-    function setVIP(address user, bool status) external onlyOwner {
-        isVIP[user] = status;
-        emit VIPStatusUpdated(user, status);
-    }
-
-    /**
     * @notice Updates the minimum lock period applied to new stakes
     * @dev Only callable by the contract owner. Changes do not retroactively affect existing stakes.
     * @param newPeriod The new minimum lock period in seconds (set to 0 to disable the hard lock)
@@ -393,10 +466,20 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
+     * @notice Updates the penalty period used for early unstake fee calculations
+     * @dev Only callable by the contract owner. This period determines the timeframe over which the early unstake fee linearly decreases from the maximum unstakeFEE to zero. Changes do not retroactively affect existing stakes, as fee calculations use the timeStaked relative to the current penaltyPeriod at unstake time. Setting a shorter period accelerates fee decay, potentially increasing liquidity and adoption, while a longer period strengthens long-term holding incentives. Emits a PenaltyPeriodUpdated event for transparency and off-chain monitoring.
+     * @param newPeriod The new penalty period in seconds (e.g., 180 days = 15552000 seconds; set to 0 to effectively disable early fees, though not recommended for protocol alignment)
+     */
+    function setPenaltyPeriod(uint256 newPeriod) external onlyOwner {
+        penaltyPeriod = newPeriod;
+        emit PenaltyPeriodUpdated(newPeriod);
+    }
+
+    /**
      * @notice Deposits USDC to mint USDD 1:1
      * @dev USDC is immediately forwarded to the vault address. USDD is minted directly to the depositor.
-     *      This function is a pure deposit mechanism with no referral logic. Referrals and associated rewards
-     *      (including automatic VIP grants) are handled separately during staking for large positions.
+     *      This function is a pure deposit mechanism with no referral logic. 
+     *      Referrals and associated rewards are handled separately during staking for large positions.
      *      Gas optimized by direct transfer to vault without intermediate steps.
      * @param amount Amount of USDC to deposit (6 decimals)
      */
@@ -414,8 +497,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
     /**
      * @notice Requests redemption by burning USDD and queuing USDC for manual fulfillment
-     * @dev Non-VIP users must redeem at least boundaryAmount. VIP users have no minimum.
-     *      Small amounts (< boundaryAmount) that pass the minimum check still incur the small-amount fee.
+     * @dev Small amounts (< boundaryAmount) that pass the minimum check still incur the small-amount fee.
      *      Gas optimized with unchecked arithmetic where overflow is impossible.
      * @param amount Amount of USDD to redeem (6 decimals)
      */
@@ -423,8 +505,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
 
         address investor = _msgSender();
-
-        if (!isVIP[investor] && amount < boundaryAmount) revert BelowMinimumRedemption();
 
         IERC20(address(this)).safeTransferFrom(investor, address(this), amount);
 
@@ -503,7 +583,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     /**
      * @notice Stakes a specified amount of the caller's free USDD balance, adding to any existing staked position
      *         with automatic compounding of pending rewards, and optionally setting a referrer to trigger
-     *         referral rewards and VIP status on large staking actions
+     *         referral rewards on large staking actions
      * @dev Users maintain a single staked position that can be increased over time. When adding to an existing stake:
      *      - Pending rewards are calculated based on the current staked balance and time elapsed.
      *      - Rewards are minted directly to the contract and added to the user's staked balance (compounding).
@@ -515,11 +595,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      *      Referral mechanics:
      *      - If a non-zero referrer address is provided and the caller has no existing referrer,
      *        it is set permanently (until cleared on unstake).
-     *      - If the new staking amount >= boundaryAmount and the user has a referrer set, a referral reward is minted to the referrer
-     *        at the configured reReRate.
-     *      - Separately, if a referrer is explicitly provided in this transaction and the new staking amount >= 1000 * boundaryAmount,
-     *        automatic VIP status is granted to the staker (if not already VIP) — incentivizing active use of referral links during
-     *        very large staking actions.
+     *      - If the new staking amount >= boundaryAmount and the user has a referrer set, a referral contribution is added for time-based rewards.
      *      
      *      This design maintains simplicity (single position, linear time-based rewards) while enabling
      *      compounding and additional stakes. Gas optimized with direct transfers, unchecked arithmetic
@@ -543,35 +619,13 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             emit ReferrerSet(investor, referrer);
         }
 
-        // Calculate and apply referral reward if new staking amount >= boundaryAmount
-        uint256 referralReward = 0;
-        if (amount >= boundaryAmount) {
-            unchecked {
-                referralReward = (amount * reReRate) / BPS_DENOMINATOR;
-            }
-            if (referralReward > 0 && referrerAddress[investor] != address(0)) {
-                _mint(referrerAddress[investor], referralReward);
-                emit ReferralRewardMinted(referrerAddress[investor], investor, referralReward, "referred_stake");
-            }
-        }
-
-        // Auto-grant VIP status if a referrer was explicitly provided in this transaction and amount >= 10 * boundaryAmount
-        if (hasReferrer && !isVIP[investor]) {
-            unchecked {
-                if (amount >= boundaryAmount * 1000) {
-                    isVIP[investor] = true;
-                    emit VIPStatusUpdated(investor, true);
-                }
-            }
-        }
-
         // Transfer the new staking amount to the contract
         IERC20(address(this)).safeTransferFrom(investor, address(this), amount);
 
         // Load current staked state
         uint256 currentStaked = stakedBalance[investor];
 
-        // If there is an existing stake, accrue and compound pending rewards
+        // If there is an existing stake, accrue and compound pending rewards and settle referral rewards
         uint256 pendingReward = 0;
         uint256 newUnlockTimestamp = block.timestamp + minLockPeriod;
 
@@ -582,12 +636,15 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             }
             if (pendingReward > 0) {
                 _mint(address(this), pendingReward);
-                emit RewardsCompounded(investor, pendingReward); // New event recommended (see below)
+                emit RewardsCompounded(investor, pendingReward);
             }
             unchecked {
                 currentStaked += pendingReward;
                 totalStaked += pendingReward;
             }
+            
+            // Settle pending referral rewards
+            _settleReferralRewards(investor);
             
             // Preserve existing unlock timestamp if it is later (prevents lock shortening)
             if (unlockTimestamp[investor] > newUnlockTimestamp) {
@@ -601,6 +658,18 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             totalStaked += amount;
         }
 
+        // Add new referral contribution if qualified
+        if (amount >= boundaryAmount && referrerAddress[investor] != address(0)) {
+            ReferralContribution[] storage contribs = referralContributions[investor];
+            if (contribs.length >= 10) revert TooManyContributions();
+            contribs.push(ReferralContribution({
+                amount: amount,
+                startTime: block.timestamp,
+                layer1ClaimedMilestones: 0,
+                layer2ClaimedMilestones: 0
+            }));
+        }
+
         // Update storage with new compounded + added balance, reset start time, and updated unlock
         stakedBalance[investor] = currentStaked;
         stakeStartTime[investor] = block.timestamp;
@@ -611,13 +680,13 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
 
     /**
     * @notice Unstakes the caller's full staked balance, minting accrued rewards and applying fees if applicable
-    * @dev Calculates and mints time-based yield rewards. Early unstake (within 365 days) incurs a linearly decreasing fee (VIP exempt).
+    * @dev Calculates and mints time-based yield rewards. Early unstake (within 365 days) incurs a linearly decreasing fee.
     *      Small stakes incur an additional high punitive fee to discourage small positions.
     *      To prevent referral farming abuse (repeated stake/unstake cycles), the user's referrer is cleared to address(0) after unstake.
     *      This forces potential abusers to make a new deposit with a new referrer and hold for at least 1 year
     *      (to avoid early unstake penalties) before they can trigger another unstake referral reward.
-    *      To encourage long-term commitment and prevent short-term cycling for rewards, VIP status is automatically revoked
-    *      upon unstake. Users must qualify again (via large referred deposit) to regain VIP privileges on future stakes.
+    *      To encourage long-term commitment and prevent short-term cycling for rewards
+    *      upon unstake. Users must qualify again (via large referred deposit) to regain.
     *      Gas optimized with unchecked arithmetic in calculations where overflow is impossible.
     */
     function unstakeUSDD() external nonReentrant {
@@ -637,11 +706,14 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             _mint(investor, rewardToMint);
         }
 
+        // Settle pending referral rewards
+        _settleReferralRewards(investor);
+
         uint256 earlyFeeAmount = 0;
-        if (!isVIP[investor] && unstakeFEE > 0 && timeStaked < SECONDS_PER_YEAR) {
+        if (unstakeFEE > 0 && timeStaked < penaltyPeriod) {
             uint256 remainingRatio;
             unchecked {
-                remainingRatio = (SECONDS_PER_YEAR - timeStaked) * BPS_DENOMINATOR / SECONDS_PER_YEAR;
+                remainingRatio = (penaltyPeriod - timeStaked) * BPS_DENOMINATOR / penaltyPeriod;
             }
             uint256 feeRate;
             unchecked {
@@ -672,13 +744,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             referrerAddress[investor] = address(0);
         }
 
-        // Revoke VIP status on unstake to incentivize long-term holding
-        // VIP privileges must be re-qualified through future large referred deposits
-
-        if (isVIP[investor]) {
-            isVIP[investor] = false;
-            emit VIPStatusUpdated(investor, false);
-        }
+        // Clear referral contributions
+        delete referralContributions[investor];
 
         uint256 totalFee;
         unchecked {
@@ -722,7 +789,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice View function to calculate early unstake fee for an account (VIP exempt)
+     * @notice View function to calculate early unstake fee for an account
      * @dev Gas optimized with unchecked arithmetic.
      * @param account Address to query
      * @return Early unstake fee amount in USDD if unstaked now
@@ -731,14 +798,12 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         uint256 bal = stakedBalance[account];
         if (bal == 0 || unstakeFEE == 0 || stakeStartTime[account] == 0) return 0;
 
-        if (isVIP[account]) return 0;
-
         uint256 timeStaked = block.timestamp - stakeStartTime[account];
-        if (timeStaked >= SECONDS_PER_YEAR) return 0;
+        if (timeStaked >= penaltyPeriod) return 0;
 
         uint256 remainingRatio;
         unchecked {
-            remainingRatio = (SECONDS_PER_YEAR - timeStaked) * BPS_DENOMINATOR / SECONDS_PER_YEAR;
+            remainingRatio = (penaltyPeriod - timeStaked) * BPS_DENOMINATOR / penaltyPeriod;
         }
         uint256 feeRate;
         unchecked {
@@ -812,6 +877,9 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
                 totalStaked += pendingReward;
             }
 
+            // Settle pending referral rewards
+            _settleReferralRewards(investor);
+
             // Preserve existing unlock timestamp if it is later (prevents lock shortening)
             if (unlockTimestamp[investor] > newUnlockTimestamp) {
                 newUnlockTimestamp = unlockTimestamp[investor];
@@ -823,6 +891,8 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             currentStaked += amount;
             totalStaked += amount;
         }
+
+        // Note: For external sale, assuming no referral trigger here, as it's owner-initiated.
 
         // Update storage with new compounded + added balance, reset start time, and updated unlock
         stakedBalance[investor] = currentStaked;
@@ -873,6 +943,138 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
                 emit AssetsWithdrawn(token, balance);
             }
         }
+    }
+
+    // New referral functions
+
+    /**
+     * @notice Calculates the current milestone index for a contribution
+     * @param contrib The referral contribution
+     * @return The current milestone index (0 to 3)
+     */
+    function _getCurrentMilestoneIndex(ReferralContribution memory contrib) internal view returns (uint8) {
+        uint256 timeStaked = block.timestamp - contrib.startTime;
+        if (timeStaked >= milestonePeriods[3]) return 4;
+        if (timeStaked >= milestonePeriods[2]) return 3;
+        if (timeStaked >= milestonePeriods[1]) return 2;
+        if (timeStaked >= milestonePeriods[0]) return 1;
+        return 0;
+    }
+
+    /**
+     * @notice Calculates pending referral reward for a layer from a referee
+     * @param referee The referee address
+     * @param layer The layer (1 or 2)
+     * @return pending The pending reward amount
+     */
+    function _calculatePending(address referee, uint8 layer) internal view returns (uint256 pending) {
+        if (layer != 1 && layer != 2) revert Unauthorized();
+        ReferralContribution[] storage contribs = referralContributions[referee];
+        uint256[] memory rates = layer == 1 ? layer1Rates : layer2Rates;
+
+        for (uint256 i = 0; i < contribs.length; i++) {
+            ReferralContribution memory contrib = contribs[i];
+            uint8 claimed = layer == 1 ? contrib.layer1ClaimedMilestones : contrib.layer2ClaimedMilestones;
+            uint8 current = _getCurrentMilestoneIndex(contrib);
+            for (uint8 j = claimed; j < current; j++) {
+                unchecked {
+                    pending += (contrib.amount * rates[j]) / BPS_DENOMINATOR;
+                }
+            }
+        }
+    }
+
+    /**
+     * @notice Updates the claimed milestones for a layer on a referee's contributions
+     * @param referee The referee address
+     * @param layer The layer (1 or 2)
+     */
+    function _updateClaimed(address referee, uint8 layer) internal {
+        ReferralContribution[] storage contribs = referralContributions[referee];
+        for (uint256 i = 0; i < contribs.length; i++) {
+            uint8 current = _getCurrentMilestoneIndex(contribs[i]);
+            if (layer == 1) {
+                contribs[i].layer1ClaimedMilestones = current;
+            } else {
+                contribs[i].layer2ClaimedMilestones = current;
+            }
+        }
+    }
+
+    /**
+     * @notice Settles pending referral rewards for both layers by minting to referrers and updating claimed
+     * @param investor The investor (referee) address
+     */
+    function _settleReferralRewards(address investor) internal {
+        address l1 = referrerAddress[investor];
+        if (l1 != address(0)) {
+            uint256 pending1 = _calculatePending(investor, 1);
+            if (pending1 > 0) {
+                _mint(l1, pending1);
+                emit ReferralRewardClaimed(l1, investor, pending1, 1);
+            }
+            _updateClaimed(investor, 1);
+
+            address l2 = referrerAddress[l1];
+            if (l2 != address(0)) {
+                uint256 pending2 = _calculatePending(investor, 2);
+                if (pending2 > 0) {
+                    _mint(l2, pending2);
+                    emit ReferralRewardClaimed(l2, investor, pending2, 2);
+                }
+                _updateClaimed(investor, 2);
+            }
+        }
+    }
+
+    /**
+     * @notice View function to check pending referral reward for the caller from a specific referee
+     * @param referee The referee address
+     * @return The pending reward amount
+     */
+    function pendingReferralReward(address referee) external view returns (uint256) {
+        address caller = _msgSender();
+        address l1 = referrerAddress[referee];
+        if (l1 == address(0)) return 0;
+
+        if (caller == l1) {
+            return _calculatePending(referee, 1);
+        } else {
+            address l2 = referrerAddress[l1];
+            if (caller == l2) {
+                return _calculatePending(referee, 2);
+            }
+        }
+        revert Unauthorized();
+    }
+
+    /**
+     * @notice Claims pending referral reward for the caller from a specific referee
+     * @param referee The referee address
+     */
+    function claimReferralRewards(address referee) external nonReentrant {
+        address caller = _msgSender();
+        address l1 = referrerAddress[referee];
+        if (l1 == address(0)) revert InvalidReferrer();
+
+        uint8 layer;
+        if (caller == l1) {
+            layer = 1;
+        } else {
+            address l2 = referrerAddress[l1];
+            if (caller == l2) {
+                layer = 2;
+            } else {
+                revert Unauthorized();
+            }
+        }
+
+        uint256 pending = _calculatePending(referee, layer);
+        if (pending > 0) {
+            _mint(caller, pending);
+            emit ReferralRewardClaimed(caller, referee, pending, layer);
+        }
+        _updateClaimed(referee, layer);
     }
 
     /**
