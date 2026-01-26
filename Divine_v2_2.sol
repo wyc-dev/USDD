@@ -62,11 +62,27 @@ contract Divine is ERC20, ReentrancyGuard {
     error InvalidParameter();
     error NoPendingRedemption();
     
+    /**
+     * @notice Address of the USDD contract being governed (updatable via governance for upgrades).
+     */
     address public USDD_ADDRESS;
+    /**
+     * @notice Instance of the IUSDD interface pointing to the current USDD contract.
+     */
     IUSDD public usdd;
+    /**
+     * @notice Duration of the voting period for proposals in seconds (initially 7 days, adjustable via governance).
+     */
     uint256 public proposalDuration = 7 days; // Initially 7 days, changeable via governance
+    /**
+     * @notice Percentage of total $DIVINE supply required for a proposal to pass (initially 45%, adjustable via governance).
+     */
     uint8 public majorityPercentage = 45; // 45% of totalSupply required to pass
 
+    /**
+     * @notice Enum defining the types of governance proposals supported by the DAO.
+     * @dev Each type corresponds to a specific administrative action on the USDD contract or DAO parameters.
+     */
     enum ProposalType {
         None,
         SetStakingParams,
@@ -87,27 +103,98 @@ contract Divine is ERC20, ReentrancyGuard {
     }
 
     // Current active proposal state
+    /**
+     * @notice Flag indicating if a proposal is currently active.
+     */
     bool public activeProposal;
+    /**
+     * @notice Unique identifier for the current proposal (incremented per proposal).
+     */
     uint256 public currentProposalId;
+    /**
+     * @notice Type of the current active proposal.
+     */
     ProposalType public currentProposalType;
+    /**
+     * @notice ABI-encoded data for the current proposal's parameters.
+     */
     bytes public currentProposalData;
+    /**
+     * @notice Timestamp when the current proposal started.
+     */
     uint256 public currentProposalStart;
+    /**
+     * @notice Cumulative yes votes for the current proposal.
+     */
     uint256 public currentYesVotes;
 
     // Historical data (for transparency/off-chain indexing)
+    /**
+     * @notice Mapping of proposal IDs to their types (historical record).
+     */
     mapping(uint256 proposalId => ProposalType) public proposalType;
+    /**
+     * @notice Mapping of proposal IDs to their ABI-encoded data (historical record).
+     */
     mapping(uint256 proposalId => bytes data) public proposalData;
+    /**
+     * @notice Mapping of proposal IDs to their final yes vote counts (historical record).
+     */
     mapping(uint256 proposalId => uint256 yesVotes) public proposalYesVotes;
+    /**
+     * @notice Mapping of proposal IDs to their execution status (historical record).
+     */
     mapping(uint256 proposalId => bool executed) public proposalExecuted;
+    /**
+     * @notice Mapping of proposal IDs to their start timestamps (historical record).
+     */
     mapping(uint256 proposalId => uint256 startTime) public proposalStartTime;
 
     // Voting tracking
+    /**
+     * @notice Nested mapping tracking if an address has voted on a specific proposal.
+     */
     mapping(uint256 => mapping(address => bool)) public hasVoted;
+    /**
+     * @notice Emitted when a new governance proposal is initiated.
+     * @param proposalType Human-readable string of the proposal type.
+     * @param id Unique identifier of the proposal.
+     * @param initiator Address that initiated the proposal.
+     */
     event ProposalInitiated(string proposalType, uint256 indexed id, address indexed initiator);
+    /**
+     * @notice Emitted when a vote is cast on a proposal.
+     * @param proposalType Human-readable string of the proposal type.
+     * @param id Unique identifier of the proposal.
+     * @param voter Address that cast the vote.
+     * @param power Voting power (balance) of the voter.
+     */
     event Voted(string proposalType, uint256 indexed id, address indexed voter, uint256 power);
+    /**
+     * @notice Emitted when a proposal is successfully executed.
+     * @param proposalType Human-readable string of the proposal type.
+     * @param id Unique identifier of the proposal.
+     */
     event ProposalExecuted(string proposalType, uint256 indexed id);
+    /**
+     * @notice Emitted when a proposal ends (passed or failed).
+     * @param proposalType Human-readable string of the proposal type.
+     * @param id Unique identifier of the proposal.
+     * @param executed True if the proposal passed and was executed, false otherwise.
+     */
     event ProposalEnded(string proposalType, uint256 indexed id, bool executed);
+    /**
+     * @notice Emitted when a redemption is fulfilled with a governance reward.
+     * @param fulfiller Address that finalized the fulfillment (receiving the reward).
+     * @param investor Address of the investor whose redemption was fulfilled.
+     * @param amount USDC amount redeemed.
+     * @param rewardMinted DIVINE reward minted to the fulfiller.
+     */
     event RedemptionFulfilledWithReward(address indexed fulfiller, address indexed investor, uint256 amount, uint256 rewardMinted); // New event for redemption incentives
+    /**
+     * @notice Emitted when the USDD contract address is updated via governance.
+     * @param newAddress The new USDD contract address.
+     */
     event USDDAddressUpdated(address indexed newAddress); // New event for USDD address updates
     
     /**
@@ -115,6 +202,7 @@ contract Divine is ERC20, ReentrancyGuard {
      * @dev The deployer receives 10 billion $DIVINE tokens, representing full initial governance rights.
      * Post-deployment, ownership of the USDD contract should be transferred to this DAO address
      * to enable decentralized administration of the yield-bearing stablecoin protocol.
+     * Initializes USDD_ADDRESS to a hardcoded value and sets the usdd interface instance.
      */
     constructor() ERC20("Divine", "DIVINE") {
         _mint(_msgSender(), 10_000_000_000 * 10 ** decimals()); // 10B DIVINE to deployer
