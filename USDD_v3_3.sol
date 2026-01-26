@@ -167,7 +167,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      *      proportional rewards. layer1ClaimedMilestones and layer2ClaimedMilestones track claimed indices (0-4)
      *      to prevent duplicate claims. Gas-optimized with uint8 for milestones (max 4).
      */
-    struct ReferralContribution {
+    struct StakingContribution {
         uint256 amount; // The staked amount for this contribution (in USDD, 6 decimals)
         uint256 startTime; // Timestamp when this contribution was recorded
         uint8 layer1ClaimedMilestones; // Number of milestones claimed for Layer 1 (0-4)
@@ -180,7 +180,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      *      Array design supports dynamic additions but keeps gas low (realistic contributions <10 per user).
      *      Cleared on unstake to prevent abuse and reclaim storage.
      */
-    mapping(address => ReferralContribution[]) public referralContributions;
+    mapping(address => StakingContribution[]) public stakingContributions;
 
 
     /**
@@ -222,11 +222,32 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     uint256[] public layer2Rates = [10, 10, 10, 10]; // bps: 0.1%, 0.1%, 0.1%, 0.1%
 
     /**
+     * @notice Flag to enable or disable the Layer 1 referral reward program.
+     * @dev When disabled, no new referral contributions will be recorded for Layer 1, but existing pending rewards can still be claimed.
+     *      This does not affect Layer 2. Initially enabled.
+     */
+    bool public layer1Enabled = true;
+
+    /**
+     * @notice Flag to enable or disable the Layer 2 referral reward program.
+     * @dev When disabled, no new referral contributions will be recorded for Layer 2, but existing pending rewards can still be claimed.
+     *      This does not affect Layer 1. Initially enabled.
+     */
+    bool public layer2Enabled = true;
+
+    /**
      * @notice Emitted when referral reward rates are updated.
      * @param layer The layer updated (1 or 2)
      * @param newRates The new array of rates in bps
      */
     event ReferralRatesUpdated(uint8 indexed layer, uint256[] newRates);
+
+    /**
+     * @notice Emitted when the referral layer enabled statuses are updated.
+     * @param layer1Enabled The new status for Layer 1
+     * @param layer2Enabled The new status for Layer 2
+     */
+    event ReferralLayersEnabledUpdated(bool layer1Enabled, bool layer2Enabled);
 
     /**
      * @notice Emitted when a new referee is added to a referrer's list during the first qualifying stake.
@@ -492,6 +513,21 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
+     * @notice Allows the owner to enable or disable Layer 1 and/or Layer 2 referral reward programs.
+     * @dev When a layer is disabled, no new referral contributions will be recorded for that layer during staking, but existing pending rewards can still be claimed or settled.
+     *      This does not affect rates, milestone calculations, or pending rewards for prior contributions, ensuring fairness for existing participants.
+     *      Disabling a layer helps control inflation from referral mints without retroactive effects, aligning with governance decisions on token economics.
+     *      Emits a ReferralLayersEnabledUpdated event for transparency and off-chain monitoring by the Divine DAO.
+     * @param _layer1Enabled True to enable Layer 1 rewards (new contributions allowed), false to disable (no new contributions for Layer 1).
+     * @param _layer2Enabled True to enable Layer 2 rewards (new contributions allowed), false to disable (no new contributions for Layer 2).
+     */
+    function setReferralLayersEnabled(bool _layer1Enabled, bool _layer2Enabled) external onlyOwner {
+        layer1Enabled = _layer1Enabled;
+        layer2Enabled = _layer2Enabled;
+        emit ReferralLayersEnabledUpdated(_layer1Enabled, _layer2Enabled);
+    }
+
+    /**
      * @notice Deposits USDC to mint USDD 1:1
      * @dev USDC is immediately forwarded to the vault address. USDD is minted directly to the depositor.
      *      This function is a pure deposit mechanism with no referral logic. 
@@ -726,7 +762,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
          *      (10 contributions per user) prevents gas bombs from excessive additions, balancing additive staking flexibility with cost control.
          *      
          *      Key mechanics:
-         *      - Pushes a new ReferralContribution struct with the staked amount, current timestamp, and zero claimed milestones for both layers.
+         *      - Pushes a new StakingContribution struct with the staked amount, current timestamp, and zero claimed milestones for both layers.
          *      - Array limited to 10 to mitigate unbounded growth risks, ensuring low gas in loops (e.g., _calculatePending/claimReferralRewards).
          *      - No events emitted here for gas savings; transparency via ReferralRewardClaimed on settlement/claim.
          *      
@@ -739,10 +775,10 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
          *      - Governance security: Divine DAO can adjust boundaryAmount or rates (via setReferralRates) to fine-tune incentives without retroactive effects,
          *        allowing monitoring of contribution patterns to maintain yield alignment with RWA returns.
          */
-        if (amount >= boundaryAmount && referrerAddress[investor] != address(0)) {
-            ReferralContribution[] storage contribs = referralContributions[investor];
+        if (amount >= boundaryAmount && referrerAddress[investor] != address(0) && (layer1Enabled || layer2Enabled)) {
+            StakingContribution[] storage contribs = stakingContributions[investor];
             if (contribs.length >= 10) revert TooManyContributions();
-            contribs.push(ReferralContribution({
+            contribs.push(StakingContribution({
                 amount: amount,
                 startTime: block.timestamp,
                 layer1ClaimedMilestones: 0,
@@ -770,7 +806,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      *      Gas optimized with unchecked arithmetic in calculations where overflow is impossible.
      *      
      *      Referral clearance: Removes the investor from the old referrer's referrerReferees via swap-pop for O(1) amortized efficiency,
-     *      ensuring accurate aggregation in totalPendingReferralRewards post-clearance; deletes referralContributions to reclaim storage and prevent abuse.
+     *      ensuring accurate aggregation in totalPendingReferralRewards post-clearance; deletes stakingContributions to reclaim storage and prevent abuse.
      *      
      *      From a token economics viewpoint, full unstake with fees (early: linear decay from unstakeFEE; small: APY-equivalent) reinforces capital consolidation and long-term alignment,
      *      as penalties make short-term/small positions unprofitable, directing funds toward larger RWA-backed yields that sustain protocol inflation (mints from rewards/referrals).
@@ -866,7 +902,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         }
 
         // Clear referral contributions
-        delete referralContributions[investor];
+        delete stakingContributions[investor];
 
         uint256 totalFee;
         unchecked {
@@ -1073,7 +1109,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @param contrib The referral contribution
      * @return The current milestone index (0 to 3)
      */
-    function _getCurrentMilestoneIndex(ReferralContribution memory contrib) internal view returns (uint8) {
+    function _getCurrentMilestoneIndex(StakingContribution memory contrib) internal view returns (uint8) {
         uint256 timeStaked = block.timestamp - contrib.startTime;
         if (timeStaked >= milestonePeriods[3]) return 4;
         if (timeStaked >= milestonePeriods[2]) return 3;
@@ -1090,11 +1126,13 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      */
     function _calculatePending(address referee, uint8 layer) internal view returns (uint256 pending) {
         if (layer != 1 && layer != 2) revert Unauthorized();
-        ReferralContribution[] storage contribs = referralContributions[referee];
+        if (layer == 1 && !layer1Enabled) return 0;
+        if (layer == 2 && !layer2Enabled) return 0;
+        StakingContribution[] storage contribs = stakingContributions[referee];
         uint256[] memory rates = layer == 1 ? layer1Rates : layer2Rates;
 
         for (uint256 i = 0; i < contribs.length; i++) {
-            ReferralContribution memory contrib = contribs[i];
+            StakingContribution memory contrib = contribs[i];
             uint8 claimed = layer == 1 ? contrib.layer1ClaimedMilestones : contrib.layer2ClaimedMilestones;
             uint8 current = _getCurrentMilestoneIndex(contrib);
             for (uint8 j = claimed; j < current; j++) {
@@ -1111,7 +1149,7 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @param layer The layer (1 or 2)
      */
     function _updateClaimed(address referee, uint8 layer) internal {
-        ReferralContribution[] storage contribs = referralContributions[referee];
+        StakingContribution[] storage contribs = stakingContributions[referee];
         for (uint256 i = 0; i < contribs.length; i++) {
             uint8 current = _getCurrentMilestoneIndex(contribs[i]);
             if (layer == 1) {
