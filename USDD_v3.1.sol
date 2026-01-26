@@ -8,7 +8,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 /**
- * @title USDD on Pantha Capital
+ * @title USDD v3.1 on Pantha Capital
  * @notice USDD is a yield-bearing stablecoin representing tokenized real-world assets (RWA) managed by Pantha Capital.
  * Users can deposit USDC to mint USDD 1:1, stake for linear APY-based rewards, request redemption (with manual fulfillment by owner or operation managers),
  * and benefit from a two-layer time-based referral system on qualifying staking actions. Early unstake and small-amount operations incur fees.
@@ -111,13 +111,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @dev Fee decreases linearly to 0 after penaltyPeriod;
      */
     uint256 public unstakeFEE = 100;
-
-    /**
-     * @notice Layer1 Referral reward rate in basis points (initially set to 100 = 1.00%)
-     * @dev Public variable allowing potential future governance updates if needed.
-     *      Current value provides 1% referral reward on qualifying events.
-     */
-    uint256 public reReRate = 100;
 
     /**
      * @notice Threshold amount in USDD (including 6 decimals) for small-amount operations and referral eligibility
@@ -251,12 +244,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @param newFEE The new maximum fee in basis points
      */
     event UnstakeFEEUpdated(uint256 indexed newFEE);
-
-    /**
-     * @notice Emitted when the referral reward rate is updated
-     * @param newReward The new referral reward rate in basis points
-     */
-    event reReRateUpdated(uint256 indexed newReward);
 
     /**
      * @notice Emitted when the boundary amount threshold is updated
@@ -406,21 +393,17 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Updates the staking APY, maximum early unstake fee, and referral reward rate in a single transaction
-     * @dev Only callable by the contract owner. All values are in basis points.
-     *      Example: 1200 = 12.00% APY, 600 = 6.00% max early fee, 100 = 1.00% referral reward.
+     * @notice Updates the staking APY and maximum early unstake fee in a single transaction
+     * @dev Only callable by the contract owner / Lhasa DAO. All values are in basis points.
      * @param _newAPY New staking APY in basis points
      * @param _newFEE New maximum early unstake fee in basis points
-     * @param _newReferralReward New referral reward rate in basis points
      */
-    function setAPYandFEE(uint256 _newAPY, uint256 _newFEE, uint256 _newReferralReward) external onlyOwner {
+    function setAPYandFEE(uint256 _newAPY, uint256 _newFEE) external onlyOwner {
         stakingAPY = _newAPY;
         unstakeFEE = _newFEE;
-        reReRate = _newReferralReward;
 
         emit StakingAPYUpdated(_newAPY);
         emit UnstakeFEEUpdated(_newFEE);
-        emit reReRateUpdated(_newReferralReward);
     }
 
     /**
