@@ -23,6 +23,7 @@ interface IUSDD {
     function fulfillRedemption(address investor) external; // For decentralized fulfillment of pending redemptions
     function revertRedemption(address investor) external; // For canceling pending redemptions
     function pendingRedemption(address investor) external view returns (uint256); // For querying pending redemption amounts
+    function setReferralLayersEnabled(bool _layer1Enabled, bool _layer2Enabled) external; // New for v3.3
 }
 
 /**
@@ -99,7 +100,8 @@ contract Divine is ERC20, ReentrancyGuard {
         ChangeProposalDuration,
         FulfillRedemption, // For decentralized redemption fulfillment with incentives
         RevertRedemption, // For canceling pending redemptions
-        SetUSDDAddress // For updating the USDD contract address (e.g., upgrades)
+        SetUSDDAddress, // For updating the USDD contract address (e.g., upgrades)
+        SetReferralLayersEnabled // New for v3.3: Enable/disable referral layers
     }
 
     // Current active proposal state
@@ -233,6 +235,7 @@ contract Divine is ERC20, ReentrancyGuard {
         if (pType == ProposalType.FulfillRedemption) return "Fulfill Redemption with Reward";
         if (pType == ProposalType.RevertRedemption) return "Revert Redemption";
         if (pType == ProposalType.SetUSDDAddress) return "Set USDD Address";
+        if (pType == ProposalType.SetReferralLayersEnabled) return "Set Referral Layers Enabled"; // New for v3.3
         return "None";
     }
 
@@ -334,6 +337,9 @@ contract Divine is ERC20, ReentrancyGuard {
             USDD_ADDRESS = newUSDD;
             usdd = IUSDD(newUSDD);
             emit USDDAddressUpdated(newUSDD);
+        } else if (pType == ProposalType.SetReferralLayersEnabled) {
+            (bool l1Enabled, bool l2Enabled) = abi.decode(currentProposalData, (bool, bool));
+            usdd.setReferralLayersEnabled(l1Enabled, l2Enabled);
         }
     }
 
@@ -495,6 +501,17 @@ contract Divine is ERC20, ReentrancyGuard {
     function proposeSetUSDDAddress(address newUSDD) external nonReentrant {
         if (newUSDD == address(0)) revert InvalidParameter();
         _initiateProposal(ProposalType.SetUSDDAddress, abi.encode(newUSDD));
+    }
+
+    /**
+     * @notice Initiates a governance proposal to enable or disable referral layers in the USDD protocol.
+     * @dev Restricted to $DIVINE holders. Allows toggling Layer 1 and Layer 2 independently to control referral incentives.
+     * Disabling prevents new contributions but allows claiming existing rewards.
+     * @param layer1Enabled New enabled status for Layer 1.
+     * @param layer2Enabled New enabled status for Layer 2.
+     */
+    function proposeSetReferralLayersEnabled(bool layer1Enabled, bool layer2Enabled) external nonReentrant {
+        _initiateProposal(ProposalType.SetReferralLayersEnabled, abi.encode(layer1Enabled, layer2Enabled));
     }
 
     /* ===================== VOTING ===================== */
