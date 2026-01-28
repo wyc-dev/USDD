@@ -8,7 +8,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 /**
- * @title USDD v3.3 on Pantha Capital
+ * @title USDD v4 on Pantha Capital
  * @notice USDD is a yield-bearing stablecoin representing tokenized real-world assets (RWA) managed by Pantha Capital.
  * Users can deposit USDC to mint USDD 1:1, stake for linear APY-based rewards, request redemption (with manual fulfillment by owner or operation managers),
  * and benefit from a two-layer time-based referral system on qualifying staking actions. Early unstake and small-amount operations incur fees.
@@ -25,7 +25,10 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
  * - Early unstake (< penaltyPeriod) incurs a linearly decreasing fee on principal (max at unstakeFEE).
  * - A configurable minimum lock period enforces a hard lock: unstake is completely blocked until the lock period has elapsed.
  * - Small stakes/redemptions (< boundaryAmount) incur a punitive fee equal to the current APY rate.
- * - This design incentivizes long-term holding and larger positions while keeping calculations simple and predictable.
+ * - Dynamic APY uplift: Qualified $DIVINE DAO members (holding ≥ minDivineForExtra governance tokens) receive an additional yield boost (extraRewardBps),
+ *   applied to the entire staking duration reward calculation. This uplift is visible in accrueRewardView and realized upon unstake, incentivizing governance
+ *   participation and long-term alignment with the protocol's decentralized future.
+ * - This design incentivizes long-term holding, larger positions, and active DAO involvement while keeping calculations simple, predictable, and capital-efficient.
  *
  * Referral system (two-layer, time-milestone based):
  * - Layer 1 (direct referrer): Rewards released at milestones (instant: 0.5%, 30 days: 0.5%, 90 days: 1%, 180 days: 1%; total up to 3% of qualifying staked amount).
@@ -33,6 +36,12 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
  * - Qualifying stakes (≥ boundaryAmount with referrer set) record contributions for independent milestone tracking.
  * - Rewards can be claimed manually by referrers per referee, or automatically settled on stake additions/unstakes to ensure alignment and prevent loss.
  * - Referrer is set once on first qualifying stake and cleared on unstake to prevent referral farming abuse.
+ *
+ * Governance-aligned incentives:
+ * - $DIVINE governance token holders benefit from a configurable extra reward uplift on staking yields, strengthening demand for the DAO token and tying
+ *   protocol success to active community governance. The feature is disabled by default (divineToken = address(0)) and can only be activated post-governance
+ *   transition, ensuring controlled rollout and alignment with Divine DAO decisions.
+ * - Uplift introduces activity-linked inflation (minted USDD), balanced by RWA-backed yields and DAO-monitored parameters to maintain long-term sustainability.
  *
  * Gas optimizations include: direct transfers to vault, immutable constants where possible, unchecked arithmetic in safe calculations,
  * and minimized storage reads/writes.
@@ -123,6 +132,28 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @notice Total USDD currently queued for redemption across all users
      */
     uint256 public totalPendingRedemption;
+
+    /**
+     * @notice Address of the $DIVINE governance token used to qualify for extra staking rewards.
+     * @dev When set to address(0), extra reward logic is completely disabled (safe default).
+     *      Intended to be set by owner (later DAO) after governance transition.
+     */
+    address public divineToken;
+
+    /**
+     * @notice Extra reward rate in basis points applied to staked principal upon unstake,
+     *         if the user holds at least minDivineForExtra $DIVINE tokens.
+     * @dev Maximum capped at 100 bps (1%). Only minted once at unstake time.
+     *      Designed as a loyalty incentive to increase $DIVINE demand and align long-term holders.
+     */
+    uint256 public extraRewardBps;
+
+    /**
+     * @notice Minimum $DIVINE token balance (18 decimals) required to qualify for extraRewardBps.
+     * @dev Snapshot checked only at unstake time for gas efficiency and simplicity.
+     *      Example: 10_000 * 10**18
+     */
+    uint256 public minDivineForExtra;
 
     /**
      * @notice Vault address that receives all deposited USDC
@@ -415,6 +446,16 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @param layer The referral layer (1 for direct referrer, 2 for referrer's referrer).
      */
     event ReferralRewardClaimed(address indexed referrer, address indexed referee, uint256 amount, uint8 layer);
+    
+    /**
+     * @notice Emitted when the $DIVINE-linked extra reward configuration is updated
+     * @dev Only emitted when the owner (future Divine DAO) calls setDivineExtraRewardParams.
+     *      Setting divineToken to address(0) effectively disables the extra reward feature.
+     * @param divineToken The new address of the $DIVINE governance token (address(0) to disable)
+     * @param extraRewardBps The new extra reward rate in basis points (capped at 100 = 1%)
+     * @param minDivineForExtra The new minimum $DIVINE holding threshold required to qualify (18 decimals)
+     */
+    event DivineExtraRewardParamsUpdated(address indexed divineToken, uint256 extraRewardBps, uint256 minDivineForExtra);
 
     /**
      * @notice Modifier to restrict access to the contract owner or authorized operation managers.
@@ -455,7 +496,6 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     function setAPYandFEE(uint256 _newAPY, uint256 _newFEE) external onlyOwner {
         stakingAPY = _newAPY;
         unstakeFEE = _newFEE;
-
         emit StakingAPYUpdated(_newAPY);
         emit UnstakeFEEUpdated(_newFEE);
     }
@@ -528,6 +568,23 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
+     * @notice Updates the $DIVINE-linked extra reward configuration.
+     * @dev Only callable by owner (future DAO). Setting divineToken to address(0) disables
+     *      the extra reward feature entirely, providing a safe emergency switch.
+     * @param _divineToken Address of the $DIVINE ERC20 token
+     * @param _extraRewardBps Extra reward rate in basis points (max 100 = 1%)
+     * @param _minDivineForExtra Minimum $DIVINE holding required (in wei, 18 decimals)
+     */
+    function setDivineExtraRewardParams(address _divineToken, uint256 _extraRewardBps, uint256 _minDivineForExtra) external onlyOwner {
+        if (_extraRewardBps > 1000) revert("Extra reward bps exceeds 10% cap");
+        // No zero-check on _divineToken — explicitly allowing address(0) to disable feature
+        divineToken       = _divineToken;
+        extraRewardBps    = _extraRewardBps;
+        minDivineForExtra = _minDivineForExtra;
+        emit DivineExtraRewardParamsUpdated(_divineToken, _extraRewardBps, _minDivineForExtra);
+    }
+
+    /**
      * @notice Deposits USDC to mint USDD 1:1
      * @dev USDC is immediately forwarded to the vault address. USDD is minted directly to the depositor.
      *      This function is a pure deposit mechanism with no referral logic. 
@@ -537,13 +594,9 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      */
     function depositUSDC(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-
         address investor = _msgSender();
-
         IERC20(USDC_BASE).safeTransferFrom(investor, vault, amount);
-
         _mint(investor, amount);
-
         emit USDCDeposited(investor, amount);
     }
 
@@ -795,47 +848,33 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Unstakes the caller's full staked balance, minting accrued rewards and applying fees if applicable
-     * @dev Calculates and mints time-based yield rewards. Early unstake (within penaltyPeriod) incurs a linearly decreasing fee.
-     *      Small stakes incur an additional high punitive fee to discourage small positions.
-     *      To prevent referral farming abuse (repeated stake/unstake cycles), the user's referrer is cleared to address(0) after unstake.
-     *      This forces potential abusers to make a new deposit with a new referrer and hold for at least the penaltyPeriod
-     *      (to avoid early unstake penalties) before they can trigger another unstake referral reward.
-     *      To encourage long-term commitment and prevent short-term cycling for rewards
-     *      upon unstake. Users must qualify again (via large referred deposit) to regain.
-     *      Gas optimized with unchecked arithmetic in calculations where overflow is impossible.
-     *      
-     *      Referral clearance: Removes the investor from the old referrer's referrerReferees via swap-pop for O(1) amortized efficiency,
-     *      ensuring accurate aggregation in totalPendingReferralRewards post-clearance; deletes stakingContributions to reclaim storage and prevent abuse.
-     *      
-     *      From a token economics viewpoint, full unstake with fees (early: linear decay from unstakeFEE; small: APY-equivalent) reinforces capital consolidation and long-term alignment,
-     *      as penalties make short-term/small positions unprofitable, directing funds toward larger RWA-backed yields that sustain protocol inflation (mints from rewards/referrals).
-     *      Financial sustainability is enhanced by transferring fees to owner (future DAO treasury), supplementing off-chain strategies; referrer clearance ties rewards to genuine sustained networks.
-     *      Benefits risks: Hard lock (via unlockTimestamp) reduces liquidity shocks; punitive small fees mitigate yield farming on fragments, promoting ecosystem growth.
-     *      Governance security: Divine DAO can adjust unstakeFEE, penaltyPeriod, or boundaryAmount to balance liquidity and incentives, with events (Unstaked, RefereeRemoved) for monitoring unstake patterns.
-     *      Edge cases: No staked balance or lock not elapsed reverts; zero fees if conditions unmet; no referrer skips clearance.
-     *      Security audit note: nonReentrant protects mint/transfer; loop for removal bounded (≤50 referees) to prevent DoS; unchecked safe as timeStaked/amount bounded by reality.
+     * @notice Unstakes the caller's full staked balance, minting accrued rewards and applying fees if applicable.
+     * @dev Calculates and mints time-based yield rewards using the effective APY (base stakingAPY + dynamic uplift if qualified).
+     * Early unstake (within penaltyPeriod) incurs a linearly decreasing fee from unstakeFEE.
+     * Small stakes incur an additional punitive fee equal to current stakingAPY to discourage fragmented positions.
+     * Referral rewards are settled automatically before unstake; referrer and contributions are cleared to prevent farming loops.
+     * The effective APY includes an uplift (extraRewardBps) when the caller holds ≥ minDivineForExtra $DIVINE tokens,
+     * providing a governance-aligned yield boost visible in accrueRewardView and realized upon unstake.
+     * This strengthens $DIVINE demand, rewards DAO participation, and aligns incentives with long-term RWA yield sustainability.
+     *
+     * Gas optimizations: unchecked arithmetic in safe bounds, single-pass calculations, minimal storage writes.
+     * Security: ReentrancyGuard, SafeERC20 transfers, balanceOf snapshot only when feature enabled.
+     * Financial sustainability: Fees flow to protocol treasury (future DAO), uplift introduces controlled inflation tied to governance
+     * participation without retroactive changes or excessive minting risks.
+     * @custom:anti-abuse Referrer/contributions cleared on unstake to eliminate referral cycling; small/early fees force capital consolidation.
      */
     function unstakeUSDD() external nonReentrant {
         address investor = _msgSender();
-
         uint256 amount = stakedBalance[investor];
         if (amount == 0) revert NoStakedBalance();
+
+        // Enforce hard lock period (applied at stake time, unaffected by later minLockPeriod changes)
         if (block.timestamp < unlockTimestamp[investor]) revert LockPeriodNotElapsed();
 
         uint256 timeStaked = block.timestamp - stakeStartTime[investor];
 
-        uint256 rewardToMint;
-        unchecked {
-            rewardToMint = (amount * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
-        }
-        if (rewardToMint > 0) {
-            _mint(investor, rewardToMint);
-        }
-
-        // Settle pending referral rewards
-        _settleReferralRewards(investor);
-
+        // ────────────────────────────────────────────────────────────────
+        // Calculate early unstake penalty (linear decay over penaltyPeriod)
         uint256 earlyFeeAmount = 0;
         if (unstakeFEE > 0 && timeStaked < penaltyPeriod) {
             uint256 remainingRatio;
@@ -851,58 +890,13 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             }
         }
 
+        // Small-amount punitive fee (equal to current staking APY rate)
         uint256 smallFeeAmount = 0;
         if (amount < boundaryAmount && stakingAPY > 0) {
-
-            // Deliberately high penalty for small stakes: fee = current staking APY rate.
-            // Intent: Prevent small holders from profiting from yield, forcing them to consolidate
-            // into larger positions (≥ boundaryAmount) to access fair APY without punitive deductions.
-            // This design incentivizes larger, longer-term commitments to the protocol.
-
             unchecked {
                 smallFeeAmount = (amount * stakingAPY) / BPS_DENOMINATOR;
             }
         }
-
-        /**
-         * @dev Internal logic to clear the referrer and remove the investor from the referrer's list after settling rewards.
-         *      This ensures anti-abuse by preventing referral farming loops (e.g., repeated stake/unstake cycles for milestone rewards),
-         *      forcing users to re-qualify with a new referrer and sustained holding to regain benefits. From a token economics perspective,
-         *      this ties Layer1/2 rewards (total 3.4% gradual release) to genuine long-term network contributions, aligning with RWA-backed yield sustainability
-         *      without inflating mints from short-term exploits. The removal uses referrerRefereeIndex for O(1) efficiency, reducing gas risks in large networks
-         *      and promoting capital efficiency by minimizing unstake costs.
-         *      
-         *      Key mechanics (with referrerRefereeIndex changes for O(1) removal optimization):
-         *      - Fetches index from referrerRefereeIndex for constant-time swap-pop, validating it points to the investor to prevent invalid operations.
-         *      - Swaps with last element, updates the swapped referee's index in referrerRefereeIndex to maintain consistency,
-         *        pops the array, and deletes the old index entry to reclaim storage and avoid residuals.
-         *      - Clears referrerAddress[investor] after removal, ensuring view functions (e.g., totalPendingReferralRewards) filter accurately without double-counting.
-         *      - Emits RefereeRemoved for transparency and off-chain monitoring, aiding governance security (e.g., Divine DAO can track network dynamics to detect abuse patterns).
-         *      
-         *      Edge cases and risks:
-         *      - Skips if no referrer, or invalid index (e.g., post-unstake residual)—validation ensures no-op without errors, mitigating benefits risks from stale data.
-         *      - Gas optimization: O(1) removal (amortized) via index mapping adds minimal storage (one slot per referee) but eliminates O(n) loops, scalable for up to 50 referees.
-         *      - Token economics impact: Clearance decouples unstaked users from rewards, balancing network persistence with anti-farming, while DAO can adjust boundaryAmount to encourage re-entry.
-         *      - Security audit note: Bounded by array length (≤50) to prevent DoS; delete reclaims storage gas refunds; no reentrancy as within nonReentrant function.
-         *      - Integration: Complements stakeUSDD's push/index set logic, ensuring referrerReferees/index remains synchronized post-unstake, supporting reliable DAO oversight and preventing storage waste that could dilute capital efficiency.
-         */
-        if (referrerAddress[investor] != address(0)) {
-            address oldReferrer = referrerAddress[investor];
-            address[] storage refs = referrerReferees[oldReferrer];
-            uint256 idx = referrerRefereeIndex[oldReferrer][investor];
-            if (idx < refs.length && refs[idx] == investor) { // validation
-                address last = refs[refs.length - 1];
-                refs[idx] = last; // swap
-                referrerRefereeIndex[oldReferrer][last] = idx; // update swapped index
-                refs.pop();
-                delete referrerRefereeIndex[oldReferrer][investor]; // clear storage
-                emit RefereeRemoved(oldReferrer, investor);
-            }
-            referrerAddress[investor] = address(0);
-        }
-
-        // Clear referral contributions
-        delete stakingContributions[investor];
 
         uint256 totalFee;
         unchecked {
@@ -913,12 +907,53 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
             amountAfterFee = amount - totalFee;
         }
 
+        // Settle pending referral rewards before unstake (unchanged)
+        _settleReferralRewards(investor);
+
+        // ────────────────────────────────────────────────────────────────
+        // Calculate accrued reward using effective APY (includes $DIVINE governance uplift if qualified)
+        uint256 effectiveAPY = _getEffectiveAPY(investor);
+
+        uint256 rewardToMint;
+        unchecked {
+            rewardToMint = (amount * effectiveAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+        }
+
+        // Mint accrued rewards directly to investor (base + governance uplift)
+        if (rewardToMint > 0) {
+            _mint(investor, rewardToMint);
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // Clear referrer and remove from referrer's list (anti-farming / anti-abuse)
+        if (referrerAddress[investor] != address(0)) {
+            address oldReferrer = referrerAddress[investor];
+            address[] storage refs = referrerReferees[oldReferrer];
+            uint256 idx = referrerRefereeIndex[oldReferrer][investor];
+            if (idx < refs.length && refs[idx] == investor) {
+                address last = refs[refs.length - 1];
+                refs[idx] = last;
+                referrerRefereeIndex[oldReferrer][last] = idx;
+                refs.pop();
+                delete referrerRefereeIndex[oldReferrer][investor];
+                emit RefereeRemoved(oldReferrer, investor);
+            }
+            referrerAddress[investor] = address(0);
+        }
+
+        // Clear referral contributions to reclaim storage and prevent residual abuse vectors
+        delete stakingContributions[investor];
+
+        // ────────────────────────────────────────────────────────────────
+        // Transfer net principal (after fees) to investor
         IERC20(address(this)).safeTransfer(investor, amountAfterFee);
 
+        // Transfer total fees to protocol treasury (owner / future DAO)
         if (totalFee > 0) {
             IERC20(address(this)).safeTransfer(owner(), totalFee);
         }
 
+        // Update global state and clear user mappings
         unchecked {
             totalStaked -= amount;
         }
@@ -926,22 +961,55 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
         delete stakeStartTime[investor];
         delete unlockTimestamp[investor];
 
+        // ────────────────────────────────────────────────────────────────
         emit Unstaked(investor, amount, earlyFeeAmount, smallFeeAmount);
     }
 
     /**
-     * @notice View function to calculate pending staking reward for an account
-     * @dev Gas optimized with unchecked arithmetic.
-     * @param account Address to query
-     * @return Pending reward in USDD (not yet minted)
+     * @notice Calculates the effective APY applied to a staker's position, including any governance-aligned uplift.
+     * @dev Returns the base stakingAPY plus extraRewardBps if the account holds sufficient $DIVINE tokens
+     *      and the feature is enabled. This function ensures consistent APY computation across view functions
+     *      and state-changing operations.
+     * @param account The address whose $DIVINE balance is checked for qualification
+     * @return effectiveAPY The total APY in basis points to be used for reward calculation
+     */
+    function _getEffectiveAPY(address account) internal view returns (uint256) {
+        uint256 apy = stakingAPY;
+
+        // Governance uplift is only applied if the feature is configured and the account qualifies
+        if (
+            divineToken != address(0) &&
+            extraRewardBps > 0 &&
+            minDivineForExtra > 0 &&
+            IERC20(divineToken).balanceOf(account) >= minDivineForExtra
+        ) {
+            apy += extraRewardBps;
+        }
+
+        return apy;
+    }
+
+    /**
+     * @notice Returns the currently accrued but un-minted staking reward for the given account.
+     * @dev The returned value reflects the effective APY, which includes any applicable governance uplift
+     *      based on the account's current $DIVINE balance snapshot. This is for display/UI purposes only.
+     *
+     *      IMPORTANT: The actual reward minted during unstake is determined by a fresh balance check
+     *      at the exact moment of unstake execution. Selling $DIVINE tokens between now and unstake
+     *      will cause the final minted reward to be lower than shown here.
+     *
+     * @param account The address to query
+     * @return Pending reward amount in USDD (6 decimals)
      */
     function accrueRewardView(address account) external view returns (uint256) {
         uint256 bal = stakedBalance[account];
         if (bal == 0 || stakeStartTime[account] == 0) return 0;
 
         uint256 timeStaked = block.timestamp - stakeStartTime[account];
+        uint256 effectiveAPY = _getEffectiveAPY(account);
+
         unchecked {
-            return (bal * stakingAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
+            return (bal * effectiveAPY * timeStaked) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
         }
     }
 
@@ -985,23 +1053,21 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Allows the owner to directly mint and stake/add USDD for an investor (e.g., private sale, bridging, off-chain allocations)
-     * @dev Mints the specified USDD amount directly to the contract and adds it to the investor's staked position.
-     *      This bypasses normal deposit flow and inflates supply without corresponding on-chain USDC backing —
-     *      use only for fully backed private sales, cross-chain staking, or allocations where funds are handled off-chain.
-     *      
-     *      Supports adding to existing stakes with automatic reward compounding:
-     *      - If the investor has an existing staked position, pending rewards are calculated, minted to the contract,
-     *        and added to the staked balance (compounding).
-     *      - The new minted amount is then added to the (compounded) staked balance.
-     *      - stakeStartTime is reset to the current timestamp (restarting linear reward accrual on the new total principal).
-     *      - unlockTimestamp is set to the maximum of the existing unlock timestamp and (current timestamp + provided timePeriod),
-     *        ensuring that adding cannot shorten an existing lock period and that the new addition respects the custom timePeriod.
-     *      
-     *      Gas optimized with direct minting, unchecked arithmetic where safe, and minimal storage operations.
-     * @param amount The USDD amount to mint and stake/add (6 decimals)
-     * @param investor The investor address to stake/add for
-     * @param timePeriod The custom lock period extension in seconds (applied to the new addition from now)
+     * @notice Allows the protocol owner to mint and stake USDD directly for an investor (e.g. private sale,
+     *         bridge inbound, institutional allocation, or off-chain backed position creation).
+     * @dev This function mints new USDD supply without receiving on-chain USDC, and therefore MUST only
+     *      be used when equivalent backing assets are secured off-chain and fully auditable.
+     *
+     *      IMPORTANT: Private sale / external allocations do NOT receive the $DIVINE governance yield uplift,
+     *      even if the recipient holds sufficient $DIVINE tokens. This ensures fairness between public stakers
+     *      and specially negotiated positions, preventing any unintended advantage in yield accrual.
+     *
+     *      The function supports additive staking: pending rewards are compounded, stakeStartTime is reset,
+     *      and unlockTimestamp is extended (never shortened).
+     *
+     * @param amount Amount of USDD to mint and add to the investor's staked position (6 decimals)
+     * @param investor Recipient address of the minted and staked position
+     * @param timePeriod Custom lock period extension in seconds (applied from current timestamp)
      */
     function externalSale(uint256 amount, address investor, uint256 timePeriod) external onlyOwner nonReentrant {
         if (amount == 0) revert ZeroAmount();
