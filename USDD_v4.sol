@@ -1268,37 +1268,42 @@ contract USDD is ERC20, Ownable, ReentrancyGuard {
      * @return layer1Total Total pending from direct referees (Layer1)
      * @return layer2Total Total pending from grandchildren (Layer2)
      */
-    function totalPendingReferralRewards() external view returns (uint256 layer1Total, uint256 layer2Total) {
+function totalPendingReferralRewards() external view returns (uint256 layer1Total, uint256 layer2Total) {
         address caller = _msgSender();
         address[] memory directRefs = referrerReferees[caller];
 
-        // Layer1: sum from direct referees
+        // Layer 1: sum pending rewards from all direct referees
         for (uint256 i = 0; i < directRefs.length; ) {
             address referee = directRefs[i];
-            if (referrerAddress[referee] == caller) { // 過濾有效
+            // Only include valid referees still pointing to caller
+            if (referrerAddress[referee] == caller) {
                 unchecked {
                     layer1Total += _calculatePending(referee, 1);
                 }
             }
-            unchecked { i++; } // gas 優化
+            unchecked { ++i; }
         }
 
-        // Layer2: sum from grandchildren (directRefs 的 referees)
+        // Layer 2: sum pending rewards from all grandchildren
         for (uint256 i = 0; i < directRefs.length; ) {
             address l1 = directRefs[i];
-            if (referrerAddress[l1] != caller) { unchecked { i++; } continue; } // 過濾
-
+            // Skip if this is no longer a valid direct referee of caller
+            if (referrerAddress[l1] != caller) {
+                unchecked { ++i; }
+                continue;
+            }
             address[] memory grandRefs = referrerReferees[l1];
             for (uint256 j = 0; j < grandRefs.length; ) {
                 address grandchild = grandRefs[j];
-                if (referrerAddress[grandchild] == l1) { // 過濾有效
+                // Only include valid grandchildren still pointing to their referrer (l1)
+                if (referrerAddress[grandchild] == l1) {
                     unchecked {
                         layer2Total += _calculatePending(grandchild, 2);
                     }
                 }
-                unchecked { j++; }
+                unchecked { ++j; }
             }
-            unchecked { i++; }
+            unchecked { ++i; }
         }
     }
 
