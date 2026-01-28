@@ -20,10 +20,11 @@ interface IUSDD {
     function externalSale(uint256 amount, address investor, uint256 timePeriod) external;
     function ResetInvestorUnlockTime(address investor, uint256 timePeriod) external;
     function withdrawAssets(address token) external;
-    function fulfillRedemption(address investor) external; // For decentralized fulfillment of pending redemptions
-    function revertRedemption(address investor) external; // For canceling pending redemptions
-    function pendingRedemption(address investor) external view returns (uint256); // For querying pending redemption amounts
-    function setReferralLayersEnabled(bool _layer1Enabled, bool _layer2Enabled) external; // New for v3.3
+    function fulfillRedemption(address investor) external; 
+    function revertRedemption(address investor) external; 
+    function pendingRedemption(address investor) external view returns (uint256); 
+    function setReferralLayersEnabled(bool _layer1Enabled, bool _layer2Enabled) external; 
+    function setDivineExtraRewardParams(address _divineToken, uint256 _extraRewardBps, uint256 _minDivineForExtra) external;
 }
 
 /**
@@ -52,16 +53,17 @@ interface IUSDD {
  */
 contract Divine is ERC20, ReentrancyGuard {
 
-    error MustHoldDivineTokens();
-    error OngoingProposal();
-    error NoOngoingProposal();
-    error ProposalNotEnded();
-    error ProposalExpired();
-    error AlreadyVoted();
-    error TotalSupplyZero();
-    error TransfersLocked();
-    error InvalidParameter();
-    error NoPendingRedemption();
+    error MustHoldDivineTokens();               // Caller holds zero $DIVINE
+    error OngoingProposal();                    // Another proposal is active
+    error NoOngoingProposal();                  // No active proposal to vote/finalize
+    error ProposalNotEnded();                   // Voting period has not yet concluded
+    error ProposalExpired();                    // Voting window has closed
+    error AlreadyVoted();                       // Voter has already cast vote on this proposal
+    error TotalSupplyZero();                    // Cannot calculate quorum with zero supply
+    error TransfersLocked();                    // $DIVINE transfers blocked during active proposal
+    error InvalidParameter();                   // Generic invalid input (zero address, etc.)
+    error NoPendingRedemption();                // No queued redemption for specified investor
+    error InvalidExtraRewardBps();              // Proposed extraRewardBps exceeds safe/reasonable cap
     
     /**
      * @notice Address of the USDD contract being governed (updatable via governance for upgrades).
@@ -101,7 +103,8 @@ contract Divine is ERC20, ReentrancyGuard {
         FulfillRedemption, // For decentralized redemption fulfillment with incentives
         RevertRedemption, // For canceling pending redemptions
         SetUSDDAddress, // For updating the USDD contract address (e.g., upgrades)
-        SetReferralLayersEnabled // New for v3.3: Enable/disable referral layers
+        SetReferralLayersEnabled, // New for v3.3: Enable/disable referral layers
+        SetDivineExtraRewardParams
     }
 
     // Current active proposal state
@@ -197,7 +200,32 @@ contract Divine is ERC20, ReentrancyGuard {
      * @notice Emitted when the USDD contract address is updated via governance.
      * @param newAddress The new USDD contract address.
      */
-    event USDDAddressUpdated(address indexed newAddress); // New event for USDD address updates
+    event USDDAddressUpdated(address indexed newAddress); // Event for USDD address updates
+    /**
+    * @notice Emitted when a governance proposal to configure (or disable) the $DIVINE-linked extra staking yield
+    * mechanism is successfully executed via the Divine DAO.
+    * @dev This event mirrors the `DivineExtraRewardParamsUpdated` event emitted by the USDD contract, enabling
+    * seamless off-chain indexing, transparency, and cross-contract traceability of governance decisions that directly
+    * impact token utility and yield distribution.
+    *
+    * The parameters set here control a dynamic APY uplift for qualified $DIVINE holders, creating a powerful incentive
+    * loop:
+    *   - Increased $DIVINE demand → stronger governance participation
+    *   - Higher effective staking yields → improved capital efficiency and long-term USDD holder alignment
+    *   - Controlled, activity-tied inflation balanced against real RWA-backed returns
+    *
+    * Emitted exclusively upon successful execution of a SetDivineExtraRewardParams proposal.
+    * Setting divineToken = address(0) disables the feature entirely (emergency governance kill-switch).
+    *
+    * @custom:impact Directly increases $DIVINE token velocity and holding incentive; recommended initial tuning:
+    *                extraRewardBps = 50–300 bps (0.5%–3%), minDivineForExtra ≈ 5,000–50,000 DIVINE depending on
+    *                circulating supply and target governance participation rate.
+    *
+    * @param divineToken The ERC20 address of the $DIVINE governance token (address(0) disables the uplift)
+    * @param extraRewardBps Additional APY applied to qualified stakers, in basis points (e.g., 200 = 2.00% extra yield)
+    * @param minDivineForExtra Minimum $DIVINE balance required to qualify for the uplift (18 decimals precision)
+    */
+    event DivineExtraRewardParamsProposedAndExecuted(address indexed divineToken, uint256 extraRewardBps, uint256 minDivineForExtra);
     
     /**
      * @notice Deploys the Divine governance token and mints the full initial supply to the deployer.
@@ -235,7 +263,8 @@ contract Divine is ERC20, ReentrancyGuard {
         if (pType == ProposalType.FulfillRedemption) return "Fulfill Redemption with Reward";
         if (pType == ProposalType.RevertRedemption) return "Revert Redemption";
         if (pType == ProposalType.SetUSDDAddress) return "Set USDD Address";
-        if (pType == ProposalType.SetReferralLayersEnabled) return "Set Referral Layers Enabled"; // New for v3.3
+        if (pType == ProposalType.SetReferralLayersEnabled) return "Set Referral Layers Enabled";
+        if (pType == ProposalType.SetDivineExtraRewardParams) return "Set Divine Extra Reward Parameters";
         return "None";
     }
 
@@ -340,6 +369,13 @@ contract Divine is ERC20, ReentrancyGuard {
         } else if (pType == ProposalType.SetReferralLayersEnabled) {
             (bool l1Enabled, bool l2Enabled) = abi.decode(currentProposalData, (bool, bool));
             usdd.setReferralLayersEnabled(l1Enabled, l2Enabled);
+        } else if (pType == ProposalType.SetDivineExtraRewardParams) {
+            (address divineToken, uint256 extraBps, uint256 minHold) =
+                abi.decode(currentProposalData, (address, uint256, uint256));
+            // Optional safety check (though USDD already enforces cap)
+            if (extraBps > 1000) revert InvalidExtraRewardBps();
+            usdd.setDivineExtraRewardParams(divineToken, extraBps, minHold);
+            emit DivineExtraRewardParamsProposedAndExecuted(divineToken, extraBps, minHold);
         }
     }
 
@@ -512,6 +548,37 @@ contract Divine is ERC20, ReentrancyGuard {
      */
     function proposeSetReferralLayersEnabled(bool layer1Enabled, bool layer2Enabled) external nonReentrant {
         _initiateProposal(ProposalType.SetReferralLayersEnabled, abi.encode(layer1Enabled, layer2Enabled));
+    }
+
+    /**
+     * @notice Proposes to configure (or disable) the $DIVINE governance token-linked extra staking yield
+     * mechanism introduced in USDD v4.
+     * @dev Allows the community to:
+     *   - Activate the feature by setting a valid divineToken address
+     *   - Tune the additional APY boost (extraRewardBps)
+     *   - Set the minimum $DIVINE holding threshold required to qualify
+     * Setting divineToken = address(0) effectively disables the uplift.
+     *
+     * This parameter directly influences $DIVINE token utility and demand, creating a positive feedback
+     * loop between governance participation and enhanced stablecoin yields — a key mechanism for
+     * long-term alignment in the Pantha Capital RWA ecosystem.
+     *
+     * @param divineToken Address of the $DIVINE ERC20 token (address(0) to disable)
+     * @param extraRewardBps Additional APY in basis points (recommended range: 50–300 bps)
+     * @param minDivineForExtra Minimum $DIVINE balance required (18 decimals)
+     */
+    function proposeSetDivineExtraRewardParams(
+        address divineToken,
+        uint256 extraRewardBps,
+        uint256 minDivineForExtra
+    ) external nonReentrant {
+        // Optional: allow address(0) to disable, but prevent meaningless zero-bps proposals
+        if (divineToken == address(0) && extraRewardBps == 0) revert InvalidParameter();
+
+        _initiateProposal(
+            ProposalType.SetDivineExtraRewardParams,
+            abi.encode(divineToken, extraRewardBps, minDivineForExtra)
+        );
     }
 
     /* ===================== VOTING ===================== */
