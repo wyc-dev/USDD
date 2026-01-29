@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
+
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
@@ -28,27 +29,27 @@ interface IUSDD {
 }
 
 /**
- * @title Lhasa DAO （$DIVINE v2） Governance Contract
+ * @title Lhasa DAO ($DIVINE v3) Governance Contract
  * @notice Lhasa DAO is the decentralized governance layer for the USDD yield-bearing stablecoin protocol.
  * It empowers holders of the $DIVINE governance token (collectively known as the Pantheon)
  * to collectively manage all administrative functions previously controlled by a single owner,
  * including decentralized fulfillment of redemptions with token minting incentives.
  *
  * The model is deliberately simple and secure: only one proposal may be active at a time,
- * with a configurable voting period (initially 7 days). Proposals pass if yes votes reach or exceed
- * the configured majority threshold of the total $DIVINE supply. To prevent vote manipulation,
+ * with a configurable voting period (initially 7 days). Proposals pass if yes votes meet both
+ * a percentage of votes cast and a minimum absolute threshold. To prevent vote manipulation,
  * $DIVINE token transfers are fully locked while a proposal is active.
  *
  * Supported actions include adjusting staking APY and fees, updating the vault address,
  * managing operation manager statuses, setting lock and penalty periods, updating referral rates,
  * executing external sales, resetting investor unlock timestamps, withdrawing assets, modifying
- * the majority threshold, changing the proposal duration, fulfilling redemptions with a 1:1
- * DIVINE/USDC minting reward to incentivize community participation in protocol liquidity maintenance,
- * reverting pending redemptions for exceptional cases, and updating the USDD contract address for upgrade possibilities.
+ * quorum parameters, changing the proposal duration, setting redemption rewards, reverting pending
+ * redemptions, and updating the USDD contract address for upgrade possibilities.
  * @dev After deployment, the ownership of the deployed USDD contract must be transferred to this
  * DAO address to complete the transition from centralized to community-led governance.
  * The redemption fulfillment reward introduces controlled inflation tied to protocol activity,
- * promoting long-term alignment and capital efficiency.
+ * promoting long-term alignment and capital efficiency. v3 adds proposal description hashes,
+ * execution timelocks, and hybrid quorum for enhanced transparency and security.
  * @custom:security-contact hopeallgood.unadvised619@passinbox.com
  */
 contract Divine is ERC20, ReentrancyGuard {
@@ -65,7 +66,9 @@ contract Divine is ERC20, ReentrancyGuard {
     error InvalidExtraRewardBps();              // Proposed extraRewardBps exceeds safe/reasonable cap
     error InvalidRedemptionRewardValue();       // Proposed rewardPerUSDC is invalid (zero when disallowed, or exceeds cap)
     error NoPendingRedemption();                // No queued redemption for specified investor
-    
+    error ProposalNotReady();                   // Timelock delay has not elapsed
+    error NoExecutableProposal();               // No passed proposal ready for execution
+
     /**
      * @notice Address of the USDD contract being governed (updatable via governance for upgrades).
      */
@@ -77,28 +80,40 @@ contract Divine is ERC20, ReentrancyGuard {
     /**
      * @notice Duration of the voting period for proposals in seconds (initially 7 days, adjustable via governance).
      */
-    uint256 public proposalDuration = 7 days; // Initially 7 days, changeable via governance
+    uint256 public proposalDuration = 7 days;
     /**
-     * @notice Percentage of total $DIVINE supply required for a proposal to pass (initially 45%, adjustable via governance).
+     * @notice Percentage of votes cast required for a proposal to pass (initially 45%, adjustable via governance).
+     * @dev Used in hybrid quorum: yesVotes >= (votesCast * participationQuorumBps / 10_000)
      */
-    uint8 public majorityPercentage = 45; // 45% of totalSupply required to pass
+    uint256 public participationQuorumBps = 4500; // 45% of votes cast
+    /**
+     * @notice Minimum absolute yes votes required for quorum (initially 3B $DIVINE, adjustable via governance).
+     * @dev Prevents low-participation passes; complements participationQuorumBps for robust governance.
+     */
+    uint256 public minQuorumAbsolute = 3_000_000_000 * 10**18; // 3B $DIVINE
     /**
      * @notice Amount of $DIVINE (in 18-decimal wei) minted to the fulfiller per 1 full USDC (6-decimal unit) redeemed.
      * @dev Adjustable via governance proposal. Represents the incentive for decentralized redemption fulfillment.
-     *      Initial value: 1 $DIVINE per 1 USDC.
-     *      Upper bound enforced: maximum 1 $DIVINE per 1 USDC to prevent excessive inflation.
+     *      Initial value: 0.1 $DIVINE per 1 USDC (lowered from v2 for controlled inflation).
+     *      Upper bound enforced: maximum 2 $DIVINE per 1 USDC to prevent excessive inflation.
      *      Setting to 0 disables the reward while still allowing fulfillment.
      */
-    uint256 public rewardPerUSDC = 1_000_000_000_000_000_000; // 1 × 10^18
+    uint256 public rewardPerUSDC = 100_000_000_000_000_000; // 0.1 × 10^18
     /**
      * @notice Maximum allowed value for rewardPerUSDC (2 $DIVINE per 1 USDC).
      * @dev Hard cap to protect long-term $DIVINE token economics and prevent governance capture attacks via extreme inflation.
      */
     uint256 public constant MAX_REWARD_PER_USDC = 2_000_000_000_000_000_000; // 2 × 10^18
+    /**
+     * @notice Delay before a passed proposal can be executed (initially 2 days).
+     * @dev Mitigates risks from malicious or erroneous proposals by allowing reaction time.
+     */
+    uint256 public constant EXECUTION_DELAY = 2 days;
 
     /**
      * @notice Enum defining the types of governance proposals supported by the DAO.
      * @dev Each type corresponds to a specific administrative action on the USDD contract or DAO parameters.
+     *      v3 adds SetParticipationQuorumBps and SetMinQuorumAbsolute for quorum tuning.
      */
     enum ProposalType {
         None,
@@ -112,13 +127,14 @@ contract Divine is ERC20, ReentrancyGuard {
         ExternalSale,
         ResetInvestorUnlockTime,
         WithdrawAssets,
-        ChangeMajorityPercentage,
         ChangeProposalDuration,
         SetRedemptionRewardPerUSDC,
         RevertRedemption,
         SetUSDDAddress,
         SetReferralLayersEnabled,
-        SetDivineExtraRewardParams
+        SetDivineExtraRewardParams,
+        SetParticipationQuorumBps,
+        SetMinQuorumAbsolute
     }
 
     // Current active proposal state
@@ -146,41 +162,55 @@ contract Divine is ERC20, ReentrancyGuard {
      * @notice Cumulative yes votes for the current proposal.
      */
     uint256 public currentYesVotes;
+    /**
+     * @notice Hash of the current proposal's description (keccak256 of UTF-8 string or IPFS CIDv0).
+     */
+    bytes32 public currentProposalDescriptionHash;
+    /**
+     * @notice Timestamp when the current passed proposal becomes executable (0 if not ready).
+     */
+    uint256 public executionReadyTimestamp;
 
     // Historical data (for transparency/off-chain indexing)
     /**
      * @notice Mapping of proposal IDs to their types (historical record).
      */
-    mapping(uint256 proposalId => ProposalType) public proposalType;
+    mapping(uint256 => ProposalType) public proposalType;
     /**
      * @notice Mapping of proposal IDs to their ABI-encoded data (historical record).
      */
-    mapping(uint256 proposalId => bytes data) public proposalData;
+    mapping(uint256 => bytes) public proposalData;
     /**
      * @notice Mapping of proposal IDs to their final yes vote counts (historical record).
      */
-    mapping(uint256 proposalId => uint256 yesVotes) public proposalYesVotes;
+    mapping(uint256 => uint256) public proposalYesVotes;
     /**
      * @notice Mapping of proposal IDs to their execution status (historical record).
      */
-    mapping(uint256 proposalId => bool executed) public proposalExecuted;
+    mapping(uint256 => bool) public proposalExecuted;
     /**
      * @notice Mapping of proposal IDs to their start timestamps (historical record).
      */
-    mapping(uint256 proposalId => uint256 startTime) public proposalStartTime;
+    mapping(uint256 => uint256) public proposalStartTime;
+    /**
+     * @notice Mapping of proposal IDs to their description hashes (historical record).
+     */
+    mapping(uint256 => bytes32) public proposalDescriptionHashes;
 
     // Voting tracking
     /**
      * @notice Nested mapping tracking if an address has voted on a specific proposal.
      */
     mapping(uint256 => mapping(address => bool)) public hasVoted;
+
     /**
      * @notice Emitted when a new governance proposal is initiated.
      * @param proposalType Human-readable string of the proposal type.
      * @param id Unique identifier of the proposal.
      * @param initiator Address that initiated the proposal.
+     * @param descriptionHash keccak256 hash of the proposal description for off-chain lookup.
      */
-    event ProposalInitiated(string proposalType, uint256 indexed id, address indexed initiator);
+    event ProposalInitiated(string proposalType, uint256 indexed id, address indexed initiator, bytes32 descriptionHash);
     /**
      * @notice Emitted when a vote is cast on a proposal.
      * @param proposalType Human-readable string of the proposal type.
@@ -189,6 +219,13 @@ contract Divine is ERC20, ReentrancyGuard {
      * @param power Voting power (balance) of the voter.
      */
     event Voted(string proposalType, uint256 indexed id, address indexed voter, uint256 power);
+    /**
+     * @notice Emitted when a passed proposal is queued for execution after timelock.
+     * @param proposalType Human-readable string of the proposal type.
+     * @param id Unique identifier of the proposal.
+     * @param executionTimestamp Timestamp when the proposal becomes executable.
+     */
+    event ProposalQueued(string proposalType, uint256 indexed id, uint256 executionTimestamp);
     /**
      * @notice Emitted when a proposal is successfully executed.
      * @param proposalType Human-readable string of the proposal type.
@@ -199,9 +236,9 @@ contract Divine is ERC20, ReentrancyGuard {
      * @notice Emitted when a proposal ends (passed or failed).
      * @param proposalType Human-readable string of the proposal type.
      * @param id Unique identifier of the proposal.
-     * @param executed True if the proposal passed and was executed, false otherwise.
+     * @param passed True if the proposal passed quorum, false otherwise.
      */
-    event ProposalEnded(string proposalType, uint256 indexed id, bool executed);
+    event ProposalEnded(string proposalType, uint256 indexed id, bool passed);
     /**
      * @notice Emitted when a redemption is fulfilled with a governance reward.
      * @param fulfiller Address that finalized the fulfillment (receiving the reward).
@@ -209,7 +246,7 @@ contract Divine is ERC20, ReentrancyGuard {
      * @param amount USDC amount redeemed.
      * @param rewardMinted DIVINE reward minted to the fulfiller.
      */
-    event RedemptionFulfilledWithReward(address indexed fulfiller, address indexed investor, uint256 amount, uint256 rewardMinted); // New event for redemption incentives
+    event RedemptionFulfilledWithReward(address indexed fulfiller, address indexed investor, uint256 amount, uint256 rewardMinted);
     /**
      * @notice Emitted when the redemption fulfillment reward rate is updated via governance.
      * @dev Provides full transparency and enables off-chain indexing of changes to the activity-linked inflation mechanism.
@@ -220,33 +257,33 @@ contract Divine is ERC20, ReentrancyGuard {
      * @notice Emitted when the USDD contract address is updated via governance.
      * @param newAddress The new USDD contract address.
      */
-    event USDDAddressUpdated(address indexed newAddress); // Event for USDD address updates
+    event USDDAddressUpdated(address indexed newAddress);
     /**
-    * @notice Emitted when a governance proposal to configure (or disable) the $DIVINE-linked extra staking yield
-    * mechanism is successfully executed via the Divine DAO.
-    * @dev This event mirrors the `DivineExtraRewardParamsUpdated` event emitted by the USDD contract, enabling
-    * seamless off-chain indexing, transparency, and cross-contract traceability of governance decisions that directly
-    * impact token utility and yield distribution.
-    *
-    * The parameters set here control a dynamic APY uplift for qualified $DIVINE holders, creating a powerful incentive
-    * loop:
-    *   - Increased $DIVINE demand → stronger governance participation
-    *   - Higher effective staking yields → improved capital efficiency and long-term USDD holder alignment
-    *   - Controlled, activity-tied inflation balanced against real RWA-backed returns
-    *
-    * Emitted exclusively upon successful execution of a SetDivineExtraRewardParams proposal.
-    * Setting divineToken = address(0) disables the feature entirely (emergency governance kill-switch).
-    *
-    * @custom:impact Directly increases $DIVINE token velocity and holding incentive; recommended initial tuning:
-    *                extraRewardBps = 50–300 bps (0.5%–3%), minDivineForExtra ≈ 5,000–50,000 DIVINE depending on
-    *                circulating supply and target governance participation rate.
-    *
-    * @param divineToken The ERC20 address of the $DIVINE governance token (address(0) disables the uplift)
-    * @param extraRewardBps Additional APY applied to qualified stakers, in basis points (e.g., 200 = 2.00% extra yield)
-    * @param minDivineForExtra Minimum $DIVINE balance required to qualify for the uplift (18 decimals precision)
-    */
+     * @notice Emitted when a governance proposal to configure (or disable) the $DIVINE-linked extra staking yield
+     * mechanism is successfully executed via the Divine DAO.
+     * @dev This event mirrors the `DivineExtraRewardParamsUpdated` event emitted by the USDD contract, enabling
+     * seamless off-chain indexing, transparency, and cross-contract traceability of governance decisions that directly
+     * impact token utility and yield distribution.
+     *
+     * The parameters set here control a dynamic APY uplift for qualified $DIVINE holders, creating a powerful incentive
+     * loop:
+     *   - Increased $DIVINE demand → stronger governance participation
+     *   - Higher effective staking yields → improved capital efficiency and long-term USDD holder alignment
+     *   - Controlled, activity-tied inflation balanced against real RWA-backed returns
+     *
+     * Emitted exclusively upon successful execution of a SetDivineExtraRewardParams proposal.
+     * Setting divineToken = address(0) disables the feature entirely (emergency governance kill-switch).
+     *
+     * @custom:impact Directly increases $DIVINE token velocity and holding incentive; recommended initial tuning:
+     *                extraRewardBps = 50–300 bps (0.5%–3%), minDivineForExtra ≈ 5,000–50,000 DIVINE depending on
+     *                circulating supply and target governance participation rate.
+     *
+     * @param divineToken The ERC20 address of the $DIVINE governance token (address(0) disables the uplift)
+     * @param extraRewardBps Additional APY applied to qualified stakers, in basis points (e.g., 200 = 2.00% extra yield)
+     * @param minDivineForExtra Minimum $DIVINE balance required to qualify for the uplift (18 decimals precision)
+     */
     event DivineExtraRewardParamsProposedAndExecuted(address indexed divineToken, uint256 extraRewardBps, uint256 minDivineForExtra);
-    
+
     /**
      * @notice Deploys the Divine governance token and mints the full initial supply to the deployer.
      * @dev The deployer receives 10 billion $DIVINE tokens, representing full initial governance rights.
@@ -278,13 +315,14 @@ contract Divine is ERC20, ReentrancyGuard {
         if (pType == ProposalType.ExternalSale) return "External Sale";
         if (pType == ProposalType.ResetInvestorUnlockTime) return "Reset Investor Unlock Time";
         if (pType == ProposalType.WithdrawAssets) return "Withdraw Assets";
-        if (pType == ProposalType.ChangeMajorityPercentage) return "Change Majority Percentage";
         if (pType == ProposalType.ChangeProposalDuration) return "Change Proposal Duration";
         if (pType == ProposalType.SetRedemptionRewardPerUSDC) return "Set Redemption Reward Per USDC";
         if (pType == ProposalType.RevertRedemption) return "Revert Redemption";
         if (pType == ProposalType.SetUSDDAddress) return "Set USDD Address";
         if (pType == ProposalType.SetReferralLayersEnabled) return "Set Referral Layers Enabled";
         if (pType == ProposalType.SetDivineExtraRewardParams) return "Set Divine Extra Reward Parameters";
+        if (pType == ProposalType.SetParticipationQuorumBps) return "Set Participation Quorum Bps";
+        if (pType == ProposalType.SetMinQuorumAbsolute) return "Set Min Quorum Absolute";
         return "None";
     }
 
@@ -305,23 +343,25 @@ contract Divine is ERC20, ReentrancyGuard {
      * and that no proposal is currently active. Records proposal metadata and emits an event.
      * @param pType The type of proposal.
      * @param data ABI-encoded proposal parameters.
+     * @param descriptionHash keccak256 hash of the proposal description for off-chain lookup.
      */
-    function _initiateProposal(ProposalType pType, bytes memory data) private {
+    function _initiateProposal(ProposalType pType, bytes memory data, bytes32 descriptionHash) private {
         if (balanceOf(_msgSender()) == 0) revert MustHoldDivineTokens();
         if (activeProposal) revert OngoingProposal();
         currentProposalId++;
         currentProposalType = pType;
         currentProposalData = data;
+        currentProposalDescriptionHash = descriptionHash;
         currentProposalStart = block.timestamp;
         currentYesVotes = 0;
         activeProposal = true;
-        emit ProposalInitiated(proposalTypeToString(pType), currentProposalId, _msgSender());
+        emit ProposalInitiated(proposalTypeToString(pType), currentProposalId, _msgSender(), descriptionHash);
     }
 
     /**
      * @dev Internal helper to execute a passed proposal. Decodes the stored data and performs
      * the corresponding administrative action on the USDD contract or updates local governance parameters.
-     * For FulfillRedemption, calls USDD's fulfillRedemption and mints 1 DIVINE per USDC redeemed as incentive,
+     * For FulfillRedemption, calls USDD's fulfillRedemption and mints rewardPerUSDC as incentive,
      * promoting decentralized liquidity provision while introducing activity-tied inflation for long-term alignment.
      */
     function _executeCurrentProposal() private {
@@ -356,15 +396,11 @@ contract Divine is ERC20, ReentrancyGuard {
         } else if (pType == ProposalType.WithdrawAssets) {
             address t = abi.decode(currentProposalData, (address));
             usdd.withdrawAssets(t);
-        } else if (pType == ProposalType.ChangeMajorityPercentage) {
-            uint8 np = abi.decode(currentProposalData, (uint8));
-            majorityPercentage = np;
         } else if (pType == ProposalType.ChangeProposalDuration) {
             uint256 newDur = abi.decode(currentProposalData, (uint256));
             proposalDuration = newDur;
         } else if (pType == ProposalType.SetRedemptionRewardPerUSDC) {
             uint256 newValue = abi.decode(currentProposalData, (uint256));
-            // Already checked in propose function, but double-defense
             if (newValue > MAX_REWARD_PER_USDC) revert InvalidRedemptionRewardValue();
             rewardPerUSDC = newValue;
             emit RedemptionRewardPerUSDCUpdated(newValue);
@@ -382,10 +418,15 @@ contract Divine is ERC20, ReentrancyGuard {
         } else if (pType == ProposalType.SetDivineExtraRewardParams) {
             (address divineToken, uint256 extraBps, uint256 minHold) =
                 abi.decode(currentProposalData, (address, uint256, uint256));
-            // Optional safety check (though USDD already enforces cap)
             if (extraBps > 1000) revert InvalidExtraRewardBps();
             usdd.setDivineExtraRewardParams(divineToken, extraBps, minHold);
             emit DivineExtraRewardParamsProposedAndExecuted(divineToken, extraBps, minHold);
+        } else if (pType == ProposalType.SetParticipationQuorumBps) {
+            uint256 newBps = abi.decode(currentProposalData, (uint256));
+            participationQuorumBps = newBps;
+        } else if (pType == ProposalType.SetMinQuorumAbsolute) {
+            uint256 newAbs = abi.decode(currentProposalData, (uint256));
+            minQuorumAbsolute = newAbs;
         }
     }
 
@@ -398,9 +439,10 @@ contract Divine is ERC20, ReentrancyGuard {
      * balancing investor returns with protocol sustainability.
      * @param newAPY Proposed new Annual Percentage Yield for staking rewards.
      * @param newUnstakeFEE Proposed new fee applied on unstaking operations.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeSetStakingParams(uint256 newAPY, uint256 newUnstakeFEE) external nonReentrant {
-        _initiateProposal(ProposalType.SetStakingParams, abi.encode(newAPY, newUnstakeFEE));
+    function proposeSetStakingParams(uint256 newAPY, uint256 newUnstakeFEE, bytes32 descriptionHash) external nonReentrant {
+        _initiateProposal(ProposalType.SetStakingParams, abi.encode(newAPY, newUnstakeFEE), descriptionHash);
     }
 
     /**
@@ -408,9 +450,10 @@ contract Divine is ERC20, ReentrancyGuard {
      * @dev Restricted to $DIVINE holders; enforces single-proposal-at-a-time rule. Reentrancy protected.
      * This parameter typically governs risk thresholds or operational limits in the yield mechanism.
      * @param newAmount Proposed new boundary amount value.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeSetBoundaryAmount(uint256 newAmount) external nonReentrant {
-        _initiateProposal(ProposalType.SetBoundaryAmount, abi.encode(newAmount));
+    function proposeSetBoundaryAmount(uint256 newAmount, bytes32 descriptionHash) external nonReentrant {
+        _initiateProposal(ProposalType.SetBoundaryAmount, abi.encode(newAmount), descriptionHash);
     }
 
     /**
@@ -418,19 +461,21 @@ contract Divine is ERC20, ReentrancyGuard {
      * @dev Restricted to $DIVINE holders; zero address prohibited to prevent irreversible fund lockup.
      * Critical for secure asset management and protocol treasury operations.
      * @param newVault Proposed new vault contract address.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeSetVault(address newVault) external nonReentrant {
+    function proposeSetVault(address newVault, bytes32 descriptionHash) external nonReentrant {
         if (newVault == address(0)) revert InvalidParameter();
-        _initiateProposal(ProposalType.SetVault, abi.encode(newVault));
+        _initiateProposal(ProposalType.SetVault, abi.encode(newVault), descriptionHash);
     }
 
     /**
      * @notice Initiates a governance proposal to adjust the minimum lock period for staked assets in the USDD protocol.
      * @dev Restricted to $DIVINE holders. Affects liquidity risk and yield commitment requirements.
      * @param newPeriod Proposed new minimum lock period in seconds.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeSetMinLockPeriod(uint256 newPeriod) external nonReentrant {
-        _initiateProposal(ProposalType.SetMinLockPeriod, abi.encode(newPeriod));
+    function proposeSetMinLockPeriod(uint256 newPeriod, bytes32 descriptionHash) external nonReentrant {
+        _initiateProposal(ProposalType.SetMinLockPeriod, abi.encode(newPeriod), descriptionHash);
     }
 
     /**
@@ -438,10 +483,11 @@ contract Divine is ERC20, ReentrancyGuard {
      * @dev Restricted to $DIVINE holders; zero address prohibited. Operation managers may have limited administrative privileges.
      * @param manager Address of the operation manager.
      * @param status Proposed status (true = appointed, false = removed).
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeSetOperationManager(address manager, bool status) external nonReentrant {
+    function proposeSetOperationManager(address manager, bool status, bytes32 descriptionHash) external nonReentrant {
         if (manager == address(0)) revert InvalidParameter();
-        _initiateProposal(ProposalType.SetOperationManager, abi.encode(manager, status));
+        _initiateProposal(ProposalType.SetOperationManager, abi.encode(manager, status), descriptionHash);
     }
 
     /**
@@ -449,18 +495,20 @@ contract Divine is ERC20, ReentrancyGuard {
      * @dev Restricted to $DIVINE holders; arrays must be length 4 or empty. Allows fine-tuning of multi-level referral incentives.
      * @param newLayer1Rates Proposed new rates for Layer 1 (empty skips update).
      * @param newLayer2Rates Proposed new rates for Layer 2 (empty skips update).
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeSetReferralRates(uint256[] calldata newLayer1Rates, uint256[] calldata newLayer2Rates) external nonReentrant {
-        _initiateProposal(ProposalType.SetReferralRates, abi.encode(newLayer1Rates, newLayer2Rates));
+    function proposeSetReferralRates(uint256[] calldata newLayer1Rates, uint256[] calldata newLayer2Rates, bytes32 descriptionHash) external nonReentrant {
+        _initiateProposal(ProposalType.SetReferralRates, abi.encode(newLayer1Rates, newLayer2Rates), descriptionHash);
     }
 
     /**
      * @notice Initiates a governance proposal to update the penalty period for early unstake fees in the USDD protocol.
      * @dev Restricted to $DIVINE holders. Affects the timeframe for fee decay, strengthening long-term holding incentives.
      * @param newPeriod Proposed new penalty period in seconds.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeSetPenaltyPeriod(uint256 newPeriod) external nonReentrant {
-        _initiateProposal(ProposalType.SetPenaltyPeriod, abi.encode(newPeriod));
+    function proposeSetPenaltyPeriod(uint256 newPeriod, bytes32 descriptionHash) external nonReentrant {
+        _initiateProposal(ProposalType.SetPenaltyPeriod, abi.encode(newPeriod), descriptionHash);
     }
 
     /**
@@ -469,10 +517,11 @@ contract Divine is ERC20, ReentrancyGuard {
      * @param amount Number of USDD tokens to be sold.
      * @param investor Recipient address for the external sale.
      * @param timePeriod Associated lock-up or vesting period for the sale.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeExternalSale(uint256 amount, address investor, uint256 timePeriod) external nonReentrant {
+    function proposeExternalSale(uint256 amount, address investor, uint256 timePeriod, bytes32 descriptionHash) external nonReentrant {
         if (amount == 0 || investor == address(0)) revert InvalidParameter();
-        _initiateProposal(ProposalType.ExternalSale, abi.encode(amount, investor, timePeriod));
+        _initiateProposal(ProposalType.ExternalSale, abi.encode(amount, investor, timePeriod), descriptionHash);
     }
 
     /**
@@ -480,28 +529,21 @@ contract Divine is ERC20, ReentrancyGuard {
      * @dev Restricted to $DIVINE holders; zero address prohibited. Used for exceptional liquidity management.
      * @param investor Address of the investor whose unlock time is to be reset.
      * @param timePeriod New unlock timestamp or period extension.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeResetInvestorUnlockTime(address investor, uint256 timePeriod) external nonReentrant {
+    function proposeResetInvestorUnlockTime(address investor, uint256 timePeriod, bytes32 descriptionHash) external nonReentrant {
         if (investor == address(0)) revert InvalidParameter();
-        _initiateProposal(ProposalType.ResetInvestorUnlockTime, abi.encode(investor, timePeriod));
+        _initiateProposal(ProposalType.ResetInvestorUnlockTime, abi.encode(investor, timePeriod), descriptionHash);
     }
 
     /**
      * @notice Initiates a governance proposal to withdraw assets of a specified token type from the USDD contract.
      * @dev Restricted to $DIVINE holders. High-risk operation requiring supermajority consensus to protect protocol treasury.
      * @param token Address of the ERC20 token to be withdrawn.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeWithdrawAssets(address token) external nonReentrant {
-        _initiateProposal(ProposalType.WithdrawAssets, abi.encode(token));
-    }
-    /**
-     * @notice Initiates a governance proposal to modify the majority percentage threshold required for proposal passage.
-     * @dev Restricted to $DIVINE holders; percentage must be between 1 and 100. Allows adaptive quorum adjustment.
-     * @param newPercentage Proposed new majority threshold (1-100).
-     */
-    function proposeChangeMajorityPercentage(uint8 newPercentage) external nonReentrant {
-        if (newPercentage == 0 || newPercentage > 100) revert InvalidParameter();
-        _initiateProposal(ProposalType.ChangeMajorityPercentage, abi.encode(newPercentage));
+    function proposeWithdrawAssets(address token, bytes32 descriptionHash) external nonReentrant {
+        _initiateProposal(ProposalType.WithdrawAssets, abi.encode(token), descriptionHash);
     }
 
     /**
@@ -509,35 +551,35 @@ contract Divine is ERC20, ReentrancyGuard {
      * @dev Restricted to $DIVINE holders; zero duration prohibited to prevent governance deadlock.
      * Enables the community to balance deliberation time with decision-making agility.
      * @param newDuration Proposed new proposal voting duration in seconds.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeChangeProposalDuration(uint256 newDuration) external nonReentrant {
+    function proposeChangeProposalDuration(uint256 newDuration, bytes32 descriptionHash) external nonReentrant {
         if (newDuration == 0) revert InvalidParameter();
-        _initiateProposal(ProposalType.ChangeProposalDuration, abi.encode(newDuration));
+        _initiateProposal(ProposalType.ChangeProposalDuration, abi.encode(newDuration), descriptionHash);
     }
 
     /**
      * @notice Initiates a governance proposal to update the $DIVINE reward amount
      * minted to the entity that fulfills a pending redemption (per 1 full USDC redeemed).
-     * @dev Restricted to $DIVINE holders. The new value must be ≤ 1 $DIVINE per USDC.
+     * @dev Restricted to $DIVINE holders. The new value must be ≤ MAX_REWARD_PER_USDC.
      *      Setting to 0 disables the reward incentive while preserving fulfillment capability.
      * @param newRewardPerUSDC Proposed new reward in 18-decimal precision (DIVINE wei per 1 USDC)
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeSetRedemptionRewardPerUSDC(uint256 newRewardPerUSDC) external nonReentrant {
+    function proposeSetRedemptionRewardPerUSDC(uint256 newRewardPerUSDC, bytes32 descriptionHash) external nonReentrant {
         if (newRewardPerUSDC > MAX_REWARD_PER_USDC) revert InvalidRedemptionRewardValue();
-        _initiateProposal(
-            ProposalType.SetRedemptionRewardPerUSDC,
-            abi.encode(newRewardPerUSDC)
-        );
+        _initiateProposal(ProposalType.SetRedemptionRewardPerUSDC, abi.encode(newRewardPerUSDC), descriptionHash);
     }
 
     /**
      * @notice Initiates a governance proposal to revert/cancel a pending redemption for a specified investor in the USDD protocol.
      * @dev Restricted to $DIVINE holders; zero address prohibited. Useful for correcting errors or handling special cases.
      * @param investor Address of the investor whose pending redemption is to be reverted.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeRevertRedemption(address investor) external nonReentrant {
+    function proposeRevertRedemption(address investor, bytes32 descriptionHash) external nonReentrant {
         if (investor == address(0)) revert InvalidParameter();
-        _initiateProposal(ProposalType.RevertRedemption, abi.encode(investor));
+        _initiateProposal(ProposalType.RevertRedemption, abi.encode(investor), descriptionHash);
     }
 
     /**
@@ -546,10 +588,11 @@ contract Divine is ERC20, ReentrancyGuard {
      * while maintaining governance security through community consensus, ensuring long-term protocol adaptability
      * and capital efficiency without compromising anti-abuse mechanisms.
      * @param newUSDD Proposed new USDD contract address.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeSetUSDDAddress(address newUSDD) external nonReentrant {
+    function proposeSetUSDDAddress(address newUSDD, bytes32 descriptionHash) external nonReentrant {
         if (newUSDD == address(0)) revert InvalidParameter();
-        _initiateProposal(ProposalType.SetUSDDAddress, abi.encode(newUSDD));
+        _initiateProposal(ProposalType.SetUSDDAddress, abi.encode(newUSDD), descriptionHash);
     }
 
     /**
@@ -558,9 +601,10 @@ contract Divine is ERC20, ReentrancyGuard {
      * Disabling prevents new contributions but allows claiming existing rewards.
      * @param layer1Enabled New enabled status for Layer 1.
      * @param layer2Enabled New enabled status for Layer 2.
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
-    function proposeSetReferralLayersEnabled(bool layer1Enabled, bool layer2Enabled) external nonReentrant {
-        _initiateProposal(ProposalType.SetReferralLayersEnabled, abi.encode(layer1Enabled, layer2Enabled));
+    function proposeSetReferralLayersEnabled(bool layer1Enabled, bool layer2Enabled, bytes32 descriptionHash) external nonReentrant {
+        _initiateProposal(ProposalType.SetReferralLayersEnabled, abi.encode(layer1Enabled, layer2Enabled), descriptionHash);
     }
 
     /**
@@ -579,19 +623,38 @@ contract Divine is ERC20, ReentrancyGuard {
      * @param divineToken Address of the $DIVINE ERC20 token (address(0) to disable)
      * @param extraRewardBps Additional APY in basis points (recommended range: 50–300 bps)
      * @param minDivineForExtra Minimum $DIVINE balance required (18 decimals)
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
      */
     function proposeSetDivineExtraRewardParams(
         address divineToken,
         uint256 extraRewardBps,
-        uint256 minDivineForExtra
+        uint256 minDivineForExtra,
+        bytes32 descriptionHash
     ) external nonReentrant {
-        // Optional: allow address(0) to disable, but prevent meaningless zero-bps proposals
         if (divineToken == address(0) && extraRewardBps == 0) revert InvalidParameter();
+        _initiateProposal(ProposalType.SetDivineExtraRewardParams, abi.encode(divineToken, extraRewardBps, minDivineForExtra), descriptionHash);
+    }
 
-        _initiateProposal(
-            ProposalType.SetDivineExtraRewardParams,
-            abi.encode(divineToken, extraRewardBps, minDivineForExtra)
-        );
+    /**
+     * @notice Initiates a governance proposal to update the participation quorum percentage (of votes cast).
+     * @dev Restricted to $DIVINE holders. Value must be between 1000 and 10000 bps. Allows adaptive quorum adjustment.
+     * @param newBps Proposed new participation quorum in basis points (1000-10000).
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
+     */
+    function proposeSetParticipationQuorumBps(uint256 newBps, bytes32 descriptionHash) external nonReentrant {
+        if (newBps < 1000 || newBps > 10000) revert InvalidParameter();
+        _initiateProposal(ProposalType.SetParticipationQuorumBps, abi.encode(newBps), descriptionHash);
+    }
+
+    /**
+     * @notice Initiates a governance proposal to update the minimum absolute quorum threshold.
+     * @dev Restricted to $DIVINE holders. Value must be >0. Allows adaptive quorum adjustment.
+     * @param newAbsolute Proposed new minimum absolute yes votes (in DIVINE wei).
+     * @param descriptionHash keccak256 hash of the proposal description (e.g. IPFS CIDv0 or UTF-8 string).
+     */
+    function proposeSetMinQuorumAbsolute(uint256 newAbsolute, bytes32 descriptionHash) external nonReentrant {
+        if (newAbsolute == 0) revert InvalidParameter();
+        _initiateProposal(ProposalType.SetMinQuorumAbsolute, abi.encode(newAbsolute), descriptionHash);
     }
 
     /* ===================== VOTING ===================== */
@@ -618,11 +681,11 @@ contract Divine is ERC20, ReentrancyGuard {
     /* ===================== EXECUTION / FINALIZATION ===================== */
 
     /**
-     * @notice Finalizes the current proposal after the voting period ends, executing it if the majority threshold is met, and rewards the executor with 1 DIVINE upon successful passage.
-     * @dev Callable by any address. Checks quorum against total $DIVINE supply.
-     * Successful execution delegates parameter changes to the USDD contract or updates local governance settings.
-     * The fixed 1 DIVINE reward incentivizes community participation in governance finalization, introducing minimal activity-tied inflation
-     * to promote long-term alignment and protocol efficiency. Historical data is recorded for transparency and auditability. Reentrancy protected.
+     * @notice Finalizes the current proposal after the voting period ends, queuing it for execution if quorum is met,
+     * and rewards the finalizer with 1 DIVINE upon successful passage.
+     * @dev Callable by any address. Uses hybrid quorum: yesVotes >= (votesCast * participationQuorumBps / 10_000)
+     *      AND yesVotes >= minQuorumAbsolute. If passed, sets executionReadyTimestamp for timelock.
+     *      Historical data is recorded for transparency and auditability. Reentrancy protected.
      */
     function finalizeCurrentProposal() external nonReentrant {
         if (!activeProposal) revert NoOngoingProposal();
@@ -631,24 +694,51 @@ contract Divine is ERC20, ReentrancyGuard {
         string memory typeStr = proposalTypeToString(currentProposalType);
         uint256 total = totalSupply();
         if (total == 0) revert TotalSupplyZero();
-        bool passed = currentYesVotes * 100 >= uint256(majorityPercentage) * total;
+
+        uint256 votesCast = currentYesVotes; // Yes-only voting
+        bool quorumMet = (currentYesVotes * 10_000 >= votesCast * participationQuorumBps) &&
+                         (currentYesVotes >= minQuorumAbsolute);
+        bool passed = quorumMet;
+
         if (passed) {
-            _executeCurrentProposal();
-            proposalExecuted[id] = true;
-            emit ProposalExecuted(typeStr, id);
-            // Reward the executor with 1 DIVINE for successful finalization, enhancing governance participation
+            executionReadyTimestamp = block.timestamp + EXECUTION_DELAY;
+            emit ProposalQueued(typeStr, id, executionReadyTimestamp);
             _mint(_msgSender(), 1 * 10 ** decimals());
         }
+
         proposalType[id] = currentProposalType;
         proposalData[id] = currentProposalData;
+        proposalDescriptionHashes[id] = currentProposalDescriptionHash;
         proposalYesVotes[id] = currentYesVotes;
         proposalStartTime[id] = currentProposalStart;
+        proposalExecuted[id] = false;
+
         activeProposal = false;
         currentProposalType = ProposalType.None;
         delete currentProposalData;
+        delete currentProposalDescriptionHash;
         delete currentYesVotes;
         delete currentProposalStart;
+
         emit ProposalEnded(typeStr, id, passed);
+    }
+
+    /**
+     * @notice Executes the current queued proposal after the timelock delay has elapsed.
+     * @dev Callable by any address. Executes the stored proposal action if ready.
+     *      Reentrancy protected. Emits ProposalExecuted upon success.
+     */
+    function executeCurrentProposal() external nonReentrant {
+        if (executionReadyTimestamp == 0) revert NoExecutableProposal();
+        if (block.timestamp < executionReadyTimestamp) revert ProposalNotReady();
+
+        _executeCurrentProposal();
+
+        uint256 id = currentProposalId;
+        proposalExecuted[id] = true;
+        emit ProposalExecuted(proposalTypeToString(currentProposalType), id);
+
+        executionReadyTimestamp = 0;
     }
 
     /**
