@@ -29,7 +29,7 @@ interface IUSDD {
 }
 
 /**
- * @title Lhasa DAO ($DIVINE v3) Governance Contract
+ * @title Lhasa DAO ($DIVINE v4) Governance Contract
  * @notice Lhasa DAO is the decentralized governance layer for the USDD yield-bearing stablecoin protocol.
  * It empowers holders of the $DIVINE governance token (collectively known as the Pantheon)
  * to collectively manage all administrative functions previously controlled by a single owner,
@@ -48,8 +48,8 @@ interface IUSDD {
  * @dev After deployment, the ownership of the deployed USDD contract must be transferred to this
  * DAO address to complete the transition from centralized to community-led governance.
  * The redemption fulfillment reward introduces controlled inflation tied to protocol activity,
- * promoting long-term alignment and capital efficiency. v3 adds proposal description hashes,
- * execution timelocks, and hybrid quorum for enhanced transparency and security.
+ * promoting long-term alignment and capital efficiency.
+ * v4 adds proposal description hashes and hybrid quorum for enhanced transparency and security.
  * @custom:security-contact hopeallgood.unadvised619@passinbox.com
  */
 contract Divine is ERC20, ReentrancyGuard {
@@ -108,7 +108,7 @@ contract Divine is ERC20, ReentrancyGuard {
     /**
      * @notice Enum defining the types of governance proposals supported by the DAO.
      * @dev Each type corresponds to a specific administrative action on the USDD contract or DAO parameters.
-     *      v3 adds SetParticipationQuorumBps and SetMinQuorumAbsolute for quorum tuning.
+     *      v4 adds SetParticipationQuorumBps and SetMinQuorumAbsolute for quorum tuning.
      */
     enum ProposalType {
         None,
@@ -161,10 +161,6 @@ contract Divine is ERC20, ReentrancyGuard {
      * @notice Hash of the current proposal's description (keccak256 of UTF-8 string or IPFS CIDv0).
      */
     bytes32 public currentProposalDescriptionHash;
-    /**
-     * @notice Timestamp when the current passed proposal becomes executable (0 if not ready).
-     */
-    uint256 public executionReadyTimestamp;
 
     // Historical data (for transparency/off-chain indexing)
     /**
@@ -214,13 +210,6 @@ contract Divine is ERC20, ReentrancyGuard {
      * @param power Voting power (balance) of the voter.
      */
     event Voted(string proposalType, uint256 indexed id, address indexed voter, uint256 power);
-    /**
-     * @notice Emitted when a passed proposal is queued for execution after timelock.
-     * @param proposalType Human-readable string of the proposal type.
-     * @param id Unique identifier of the proposal.
-     * @param executionTimestamp Timestamp when the proposal becomes executable.
-     */
-    event ProposalQueued(string proposalType, uint256 indexed id, uint256 executionTimestamp);
     /**
      * @notice Emitted when a proposal is successfully executed.
      * @param proposalType Human-readable string of the proposal type.
@@ -341,7 +330,7 @@ contract Divine is ERC20, ReentrancyGuard {
      * @param descriptionHash keccak256 hash of the proposal description for off-chain lookup.
      */
     function _initiateProposal(ProposalType pType, bytes memory data, bytes32 descriptionHash) private {
-        if (balanceOf(_msgSender()) >= minQuorumAbsolute / 10) revert MustHoldThresholdDivine();
+        if (balanceOf(_msgSender()) < minQuorumAbsolute / 10) revert MustHoldThresholdDivine();
         if (activeProposal) revert OngoingProposal();
         currentProposalId++;
         currentProposalType = pType;
@@ -676,11 +665,17 @@ contract Divine is ERC20, ReentrancyGuard {
     /* ===================== EXECUTION / FINALIZATION ===================== */
 
     /**
-     * @notice Finalizes the current proposal after the voting period ends, queuing it for execution if quorum is met,
-     * and rewards the finalizer with 1 DIVINE upon successful passage.
-     * @dev Callable by any address. Uses hybrid quorum: yesVotes >= (votesCast * participationQuorumBps / 10_000)
-     *      AND yesVotes >= minQuorumAbsolute. If passed, sets executionReadyTimestamp for timelock.
-     *      Historical data is recorded for transparency and auditability. Reentrancy protected.
+     * @notice Finalizes the current proposal after the voting period ends.
+     *         If quorum is met, the proposal is immediately executed and the finalizer is rewarded with 1 $DIVINE.
+     * @dev Callable by any address. Uses hybrid quorum:
+     *      - yesVotes >= (votesCast * participationQuorumBps / 10_000)  // percentage of votes cast
+     *      - AND yesVotes >= minQuorumAbsolute                        // absolute minimum threshold
+     *      On passage: executes the proposal immediately, records execution status as true,
+     *      mints 1 $DIVINE to the finalizer, and emits ProposalExecuted.
+     *      Regardless of outcome: records full historical data (type, data, votes, timestamps, description hash, and correct execution status),
+     *      resets active proposal state, and emits ProposalEnded with pass/fail result.
+     *      Reentrancy protected. Preserves ultra-minimalist immediate-execution design for low governance friction
+     *      while ensuring accurate on-chain historical transparency and auditability.
      */
     function finalizeCurrentProposal() external nonReentrant {
         if (!activeProposal) revert NoOngoingProposal();
@@ -692,23 +687,24 @@ contract Divine is ERC20, ReentrancyGuard {
 
         uint256 votesCast = currentYesVotes; // Yes-only voting
         bool quorumMet = (currentYesVotes * 10_000 >= votesCast * participationQuorumBps) &&
-                         (currentYesVotes >= minQuorumAbsolute);
+                        (currentYesVotes >= minQuorumAbsolute);
         bool passed = quorumMet;
 
-        if (passed) {
-            _executeCurrentProposal();
-            proposalExecuted[id] = true;
-            emit ProposalExecuted(typeStr, id);
-            _mint(_msgSender(), 1 * 10 ** decimals());
-        }
-
+        // Record historical data FIRST (before any state reset)
         proposalType[id] = currentProposalType;
         proposalData[id] = currentProposalData;
         proposalDescriptionHashes[id] = currentProposalDescriptionHash;
         proposalYesVotes[id] = currentYesVotes;
         proposalStartTime[id] = currentProposalStart;
-        proposalExecuted[id] = false;
+        proposalExecuted[id] = passed;  // Set correctly based on outcome
 
+        if (passed) {
+            _executeCurrentProposal();
+            emit ProposalExecuted(typeStr, id);
+            _mint(_msgSender(), 1 * 10 ** decimals());
+        }
+
+        // Reset active proposal state
         activeProposal = false;
         currentProposalType = ProposalType.None;
         delete currentProposalData;
