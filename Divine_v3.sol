@@ -106,10 +106,10 @@ contract Divine is ERC20, ReentrancyGuard {
      */
     uint256 public constant MAX_REWARD_PER_USDC = 2_000_000_000_000_000_000; // 2 × 10^18
     /**
-     * @notice Delay before a passed proposal can be executed (initially 2 days).
+     * @notice Delay before a passed proposal can be executed (initially 1 days).
      * @dev Mitigates risks from malicious or erroneous proposals by allowing reaction time.
      */
-    uint256 public constant EXECUTION_DELAY = 2 days;
+    uint256 public constant EXECUTION_DELAY = 1 days;
 
     /**
      * @notice Enum defining the types of governance proposals supported by the DAO.
