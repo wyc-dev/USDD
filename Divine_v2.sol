@@ -28,7 +28,7 @@ interface IUSDD {
 }
 
 /**
- * @title Lhasa DAO Governance Contract
+ * @title Lhasa DAO （$DIVINE v2） Governance Contract
  * @notice Lhasa DAO is the decentralized governance layer for the USDD yield-bearing stablecoin protocol.
  * It empowers holders of the $DIVINE governance token (collectively known as the Pantheon)
  * to collectively manage all administrative functions previously controlled by a single owner,
@@ -62,8 +62,9 @@ contract Divine is ERC20, ReentrancyGuard {
     error TotalSupplyZero();                    // Cannot calculate quorum with zero supply
     error TransfersLocked();                    // $DIVINE transfers blocked during active proposal
     error InvalidParameter();                   // Generic invalid input (zero address, etc.)
-    error NoPendingRedemption();                // No queued redemption for specified investor
     error InvalidExtraRewardBps();              // Proposed extraRewardBps exceeds safe/reasonable cap
+    error InvalidRedemptionRewardValue();       // Proposed rewardPerUSDC is invalid (zero when disallowed, or exceeds cap)
+    error NoPendingRedemption();                // No queued redemption for specified investor
     
     /**
      * @notice Address of the USDD contract being governed (updatable via governance for upgrades).
@@ -81,6 +82,19 @@ contract Divine is ERC20, ReentrancyGuard {
      * @notice Percentage of total $DIVINE supply required for a proposal to pass (initially 45%, adjustable via governance).
      */
     uint8 public majorityPercentage = 45; // 45% of totalSupply required to pass
+    /**
+     * @notice Amount of $DIVINE (in 18-decimal wei) minted to the fulfiller per 1 full USDC (6-decimal unit) redeemed.
+     * @dev Adjustable via governance proposal. Represents the incentive for decentralized redemption fulfillment.
+     *      Initial value: 1 $DIVINE per 1 USDC.
+     *      Upper bound enforced: maximum 1 $DIVINE per 1 USDC to prevent excessive inflation.
+     *      Setting to 0 disables the reward while still allowing fulfillment.
+     */
+    uint256 public rewardPerUSDC = 1_000_000_000_000_000_000; // 1 × 10^18
+    /**
+     * @notice Maximum allowed value for rewardPerUSDC (2 $DIVINE per 1 USDC).
+     * @dev Hard cap to protect long-term $DIVINE token economics and prevent governance capture attacks via extreme inflation.
+     */
+    uint256 public constant MAX_REWARD_PER_USDC = 2_000_000_000_000_000_000; // 2 × 10^18
 
     /**
      * @notice Enum defining the types of governance proposals supported by the DAO.
@@ -100,10 +114,10 @@ contract Divine is ERC20, ReentrancyGuard {
         WithdrawAssets,
         ChangeMajorityPercentage,
         ChangeProposalDuration,
-        FulfillRedemption, // For decentralized redemption fulfillment with incentives
-        RevertRedemption, // For canceling pending redemptions
-        SetUSDDAddress, // For updating the USDD contract address (e.g., upgrades)
-        SetReferralLayersEnabled, // New for v3.3: Enable/disable referral layers
+        SetRedemptionRewardPerUSDC,
+        RevertRedemption,
+        SetUSDDAddress,
+        SetReferralLayersEnabled,
         SetDivineExtraRewardParams
     }
 
@@ -197,6 +211,12 @@ contract Divine is ERC20, ReentrancyGuard {
      */
     event RedemptionFulfilledWithReward(address indexed fulfiller, address indexed investor, uint256 amount, uint256 rewardMinted); // New event for redemption incentives
     /**
+     * @notice Emitted when the redemption fulfillment reward rate is updated via governance.
+     * @dev Provides full transparency and enables off-chain indexing of changes to the activity-linked inflation mechanism.
+     * @param newRewardPerUSDC New reward amount in 18-decimal precision (DIVINE wei per 1 full USDC)
+     */
+    event RedemptionRewardPerUSDCUpdated(uint256 indexed newRewardPerUSDC);
+    /**
      * @notice Emitted when the USDD contract address is updated via governance.
      * @param newAddress The new USDD contract address.
      */
@@ -260,7 +280,7 @@ contract Divine is ERC20, ReentrancyGuard {
         if (pType == ProposalType.WithdrawAssets) return "Withdraw Assets";
         if (pType == ProposalType.ChangeMajorityPercentage) return "Change Majority Percentage";
         if (pType == ProposalType.ChangeProposalDuration) return "Change Proposal Duration";
-        if (pType == ProposalType.FulfillRedemption) return "Fulfill Redemption with Reward";
+        if (pType == ProposalType.SetRedemptionRewardPerUSDC) return "Set Redemption Reward Per USDC";
         if (pType == ProposalType.RevertRedemption) return "Revert Redemption";
         if (pType == ProposalType.SetUSDDAddress) return "Set USDD Address";
         if (pType == ProposalType.SetReferralLayersEnabled) return "Set Referral Layers Enabled";
@@ -342,22 +362,12 @@ contract Divine is ERC20, ReentrancyGuard {
         } else if (pType == ProposalType.ChangeProposalDuration) {
             uint256 newDur = abi.decode(currentProposalData, (uint256));
             proposalDuration = newDur;
-        } else if (pType == ProposalType.FulfillRedemption) {
-            address investor = abi.decode(currentProposalData, (address));
-            // Fetch redeemed amount before fulfillment to ensure accurate reward calculation
-            uint256 amount = usdd.pendingRedemption(investor);
-            if (amount == 0) revert NoPendingRedemption(); // Prevent abuse with zero-amount proposals
-            usdd.fulfillRedemption(investor);
-            // Reward: Mint 1 DIVINE (18 decimals) per 1 USDC (6 decimals) redeemed, adjusting for decimal difference
-            // This incentivizes decentralized liquidity provision, tying governance token inflation to protocol activity for long-term alignment
-            uint256 reward;
-            unchecked {
-                reward = amount * 1_000_000_000_000; // amount * 10^12; safe as amount is uint256 and multiplication won't overflow in practice
-            }
-            if (reward > 0) {
-                _mint(_msgSender(), reward); // Mint reward to proposal finalizer (assumed fulfiller)
-                emit RedemptionFulfilledWithReward(_msgSender(), investor, amount, reward);
-            }
+        } else if (pType == ProposalType.SetRedemptionRewardPerUSDC) {
+            uint256 newValue = abi.decode(currentProposalData, (uint256));
+            // Already checked in propose function, but double-defense
+            if (newValue > MAX_REWARD_PER_USDC) revert InvalidRedemptionRewardValue();
+            rewardPerUSDC = newValue;
+            emit RedemptionRewardPerUSDCUpdated(newValue);
         } else if (pType == ProposalType.RevertRedemption) {
             address investor = abi.decode(currentProposalData, (address));
             usdd.revertRedemption(investor);
@@ -506,15 +516,18 @@ contract Divine is ERC20, ReentrancyGuard {
     }
 
     /**
-     * @notice Initiates a governance proposal to fulfill a pending redemption for a specified investor in the USDD protocol.
-     * @dev Restricted to $DIVINE holders; zero address prohibited. Upon passage, executes the fulfillment and mints
-     * 1 DIVINE per USDC redeemed as a reward to the proposal finalizer, incentivizing decentralized liquidity provision.
-     * This promotes protocol sustainability by distributing governance tokens based on contribution to redemption efficiency.
-     * @param investor Address of the investor whose pending redemption is to be fulfilled.
+     * @notice Initiates a governance proposal to update the $DIVINE reward amount
+     * minted to the entity that fulfills a pending redemption (per 1 full USDC redeemed).
+     * @dev Restricted to $DIVINE holders. The new value must be ≤ 1 $DIVINE per USDC.
+     *      Setting to 0 disables the reward incentive while preserving fulfillment capability.
+     * @param newRewardPerUSDC Proposed new reward in 18-decimal precision (DIVINE wei per 1 USDC)
      */
-    function proposeFulfillRedemption(address investor) external nonReentrant {
-        if (investor == address(0)) revert InvalidParameter();
-        _initiateProposal(ProposalType.FulfillRedemption, abi.encode(investor));
+    function proposeSetRedemptionRewardPerUSDC(uint256 newRewardPerUSDC) external nonReentrant {
+        if (newRewardPerUSDC > MAX_REWARD_PER_USDC) revert InvalidRedemptionRewardValue();
+        _initiateProposal(
+            ProposalType.SetRedemptionRewardPerUSDC,
+            abi.encode(newRewardPerUSDC)
+        );
     }
 
     /**
@@ -636,6 +649,37 @@ contract Divine is ERC20, ReentrancyGuard {
         delete currentYesVotes;
         delete currentProposalStart;
         emit ProposalEnded(typeStr, id, passed);
+    }
+
+    /**
+     * @notice Allows any address to fulfill a pending redemption for an investor and receive the current governance reward.
+     * @dev Callable by anyone (no $DIVINE balance required). Pulls USDC from the caller's balance via USDD.fulfillRedemption.
+     *      Mints $DIVINE reward to the caller based on rewardPerUSDC × redeemed USDC amount.
+     *      If rewardPerUSDC is 0, fulfillment still succeeds but no reward is minted.
+     *      Protected against reentrancy and zero-amount abuse.
+     * @param investor The address whose pending redemption is to be fulfilled
+     * @custom:security This function decentralizes redemption liquidity provision, removing the previous governance-only restriction.
+     *                  Reward is capped by governance (max 2 $DIVINE per USDC) to control inflation.
+     */
+    function fulfillRedemptionDirect(address investor) external nonReentrant {
+        if (investor == address(0)) revert InvalidParameter();
+
+        uint256 amount = usdd.pendingRedemption(investor);
+        if (amount == 0) revert NoPendingRedemption();
+
+        // Execute the redemption (pulls USDC from msg.sender's balance)
+        usdd.fulfillRedemption(investor);
+
+        // Calculate and mint reward if configured
+        if (rewardPerUSDC > 0) {
+            // amount is in 6 decimals (USDC), rewardPerUSDC is wei DIVINE per full USDC unit
+            uint256 reward = (amount * rewardPerUSDC) / 1_000_000;
+
+            if (reward > 0) {
+                _mint(_msgSender(), reward);
+                emit RedemptionFulfilledWithReward(_msgSender(), investor, amount, reward);
+            }
+        }
     }
 
     /* ===================== TRANSFER LOCK DURING VOTING ===================== */
