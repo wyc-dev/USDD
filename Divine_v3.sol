@@ -105,11 +105,6 @@ contract Divine is ERC20, ReentrancyGuard {
      * @dev Hard cap to protect long-term $DIVINE token economics and prevent governance capture attacks via extreme inflation.
      */
     uint256 public constant MAX_REWARD_PER_USDC = 2_000_000_000_000_000_000; // 2 × 10^18
-    /**
-     * @notice Delay before a passed proposal can be executed (initially 1 days).
-     * @dev Mitigates risks from malicious or erroneous proposals by allowing reaction time.
-     */
-    uint256 public constant EXECUTION_DELAY = 1 days;
 
     /**
      * @notice Enum defining the types of governance proposals supported by the DAO.
@@ -702,8 +697,9 @@ contract Divine is ERC20, ReentrancyGuard {
         bool passed = quorumMet;
 
         if (passed) {
-            executionReadyTimestamp = block.timestamp + EXECUTION_DELAY;
-            emit ProposalQueued(typeStr, id, executionReadyTimestamp);
+            _executeCurrentProposal();
+            proposalExecuted[id] = true;
+            emit ProposalExecuted(typeStr, id);
             _mint(_msgSender(), 1 * 10 ** decimals());
         }
 
@@ -722,24 +718,6 @@ contract Divine is ERC20, ReentrancyGuard {
         delete currentProposalStart;
 
         emit ProposalEnded(typeStr, id, passed);
-    }
-
-    /**
-     * @notice Executes the current queued proposal after the timelock delay has elapsed.
-     * @dev Callable by any address. Executes the stored proposal action if ready.
-     *      Reentrancy protected. Emits ProposalExecuted upon success.
-     */
-    function executeCurrentProposal() external nonReentrant {
-        if (executionReadyTimestamp == 0) revert NoExecutableProposal();
-        if (block.timestamp < executionReadyTimestamp) revert ProposalNotReady();
-
-        _executeCurrentProposal();
-
-        uint256 id = currentProposalId;
-        proposalExecuted[id] = true;
-        emit ProposalExecuted(proposalTypeToString(currentProposalType), id);
-
-        executionReadyTimestamp = 0;
     }
 
     /**
