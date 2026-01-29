@@ -55,6 +55,7 @@ interface IUSDD {
 contract Divine is ERC20, ReentrancyGuard {
 
     error MustHoldDivineTokens();               // Caller holds zero $DIVINE
+    error MustHoldThresholdDivine();            // Should hold enough $DIVINE to initiate proposal
     error OngoingProposal();                    // Another proposal is active
     error NoOngoingProposal();                  // No active proposal to vote/finalize
     error ProposalNotEnded();                   // Voting period has not yet concluded
@@ -346,7 +347,7 @@ contract Divine is ERC20, ReentrancyGuard {
      * @param descriptionHash keccak256 hash of the proposal description for off-chain lookup.
      */
     function _initiateProposal(ProposalType pType, bytes memory data, bytes32 descriptionHash) private {
-        if (balanceOf(_msgSender()) == 0) revert MustHoldDivineTokens();
+        if (balanceOf(_msgSender()) >= minQuorumAbsolute / 10) revert MustHoldThresholdDivine();
         if (activeProposal) revert OngoingProposal();
         currentProposalId++;
         currentProposalType = pType;
