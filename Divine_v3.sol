@@ -67,7 +67,6 @@ contract Divine is ERC20, ReentrancyGuard {
     error InvalidExtraRewardBps();              // Proposed extraRewardBps exceeds safe/reasonable cap
     error InvalidRedemptionRewardValue();       // Proposed rewardPerUSDC is invalid (zero when disallowed, or exceeds cap)
     error NoPendingRedemption();                // No queued redemption for specified investor
-    error ProposalNotReady();                   // Timelock delay has not elapsed
     error NoExecutableProposal();               // No passed proposal ready for execution
 
     /**
@@ -79,9 +78,9 @@ contract Divine is ERC20, ReentrancyGuard {
      */
     IUSDD public usdd;
     /**
-     * @notice Duration of the voting period for proposals in seconds (initially 7 days, adjustable via governance).
+     * @notice Duration of the voting period for proposals in seconds (initially 3 days, adjustable via governance).
      */
-    uint256 public proposalDuration = 7 days;
+    uint256 public proposalDuration = 3 days;
     /**
      * @notice Percentage of votes cast required for a proposal to pass (initially 45%, adjustable via governance).
      * @dev Used in hybrid quorum: yesVotes >= (votesCast * participationQuorumBps / 10_000)
